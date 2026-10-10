@@ -237,10 +237,13 @@ class Selection:
     names, per changed or deleted file, what decided it: ``full-run``,
     ``no-tests-needed``, ``deleted-test``, ``test-tree``, ``test-package``,
     ``conftest``, ``helper-importers``, ``coverage``,
-    ``changed-test``, ``call-graph``, ``import-graph``, ``filename-pattern``,
-    ``unknown``, or ``none`` when nothing was asked (no index). ``why`` says,
-    per selected test file, what put it in: the changed file and evidence that
-    reached it, or the reason it runs with every subset.
+    ``changed-test``, ``call-graph``, ``import-graph``, ``conftest-fixture``
+    (a test using a conftest fixture that reaches the change),
+    ``conftest-import-check`` (one test that loads a conftest the change reaches
+    only through its imports), ``filename-pattern``, ``unknown``, or ``none``
+    when nothing was asked (no index). ``why`` says, per selected test file,
+    what put it in: the changed file and evidence that reached it, or the
+    reason it runs with every subset.
     """
 
     run_all: bool
@@ -529,8 +532,20 @@ def _why(
         for _, test_file in tests:
             if test_file and test_file not in out:
                 via = "coverage" if test_file in covered else vias.get(test_file, basis)
-                out[test_file] = f"{path} changed ({via})"
+                out[test_file] = f"{path} changed ({_VIA_WHY.get(via, via)})"
     return out
+
+
+# The two vias a narrowed conftest route adds (``conftest_routes``), spelled out.
+_VIA_WHY = {
+    "conftest-fixture": (
+        "conftest-fixture: it asks for a conftest fixture whose code runs into the change"
+    ),
+    "conftest-import-check": (
+        "conftest-import-check: the change reaches a conftest above it only through the "
+        "conftest's imports, and this test is that conftest's import check"
+    ),
+}
 
 
 def selected_by_change(selection: Selection, test: str) -> bool:
@@ -643,6 +658,8 @@ def _notes(
         )
     if skipped:
         out.append(f"{len(skipped)} changed file(s) are documentation: no tests needed.")
+    # How each conftest on a route was decided (``conftest_routes``).
+    out.extend(inp.tiers.get("scope_notes") or ())
     return out
 
 
@@ -1035,6 +1052,16 @@ def expand_test_scopes(tests: Iterable[str], test_files: Collection[str]) -> lis
     return list(out)
 
 
+_VIAS = (
+    "changed-test",
+    "call-graph",
+    "import-graph",
+    "conftest-fixture",
+    "conftest-import-check",
+    "filename-pattern",
+)
+
+
 def _basis(
     path: str,
     covered: Mapping[str, Any],
@@ -1045,7 +1072,7 @@ def _basis(
     if path in covered:
         return "coverage"
     vias = {via for _, via in inferred.get(path, ())}
-    for via in ("changed-test", "call-graph", "import-graph", "filename-pattern"):
+    for via in _VIAS:
         if via in vias:
             return via
     return "unknown" if path in unknown else "none"

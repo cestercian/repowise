@@ -143,7 +143,11 @@ def impacted_tests_command(
 
     explain = explain.replace("\\", "/").removeprefix("./") if explain else None
     checkout = _read_checkout(repo_path)
-    result = run_async(_collect(repo_path, change, checkout.roots, config, explain))
+    result = run_async(
+        _collect(
+            repo_path, change, checkout.roots, config, explain, dict(checkout.pytest_texts)
+        )
+    )
     result["diff"] = change.label
     if config is not None:
         result["selection"] = _select(repo_path, change, result, config, checkout)
@@ -201,12 +205,15 @@ async def _collect(
     roots: PytestRoots | None = None,
     config=None,
     explain: str | None = None,
+    pytest_texts: dict | None = None,
 ) -> dict:
     """Resolve the change's files to impacted tests + labelled fallbacks.
 
     With a selection *config*, files changed since the index was built are
     walked too, so selection can add the tests reaching them. With *explain*,
     the import route from that test to a changed file is looked up as well.
+    *pytest_texts* are the checkout's conftests and pytest configs by path
+    (``_read_checkout``); without them no conftest route is narrowed.
     """
     from repowise.core.persistence.crud import (
         get_health_metrics,
@@ -238,7 +245,14 @@ async def _collect(
         repo_keys = {m.file_path for m in await get_health_metrics(session, repo_id)}
         routes = [] if config is None else _gap_routes(repo_path, change, config, repo_keys, out)
         await _resolve_impacted(
-            session, repo_id, _query_lines(change, measured), repo_keys, out, roots, routes
+            session,
+            repo_id,
+            _query_lines(change, measured),
+            repo_keys,
+            out,
+            roots,
+            routes,
+            pytest_texts,
         )
         await _place_tests(session, repo_id, out)
         if explain:
@@ -377,6 +391,7 @@ def _empty_result(changed_files: int) -> dict:
         "always_run_tests": {},
         "explain_route": [],
         "helper_importers": {},
+        "scope_notes": [],
         "changed_files": changed_files,
         "covered": {},  # test_id -> {test_file, source_files: [...]}
         "inferred": [],  # {source_file, test_file, via}
@@ -392,6 +407,7 @@ async def _resolve_impacted(
     out: dict,
     roots: PytestRoots | None = None,
     routes: tuple[str, ...] | list[str] = (),
+    pytest_texts: dict | None = None,
 ) -> dict:
     """Classify each changed file: covered tests, inferred tests, or unknown.
 
@@ -449,12 +465,15 @@ async def _resolve_impacted(
         return out
 
     try:
-        candidates, importers = await _graph_candidates(session, repo_id, graph_targets, roots)
+        candidates, importers, notes = await _graph_candidates(
+            session, repo_id, graph_targets, roots, pytest_texts=pytest_texts
+        )
     except Exception as exc:
         # Nothing the graph said can be trusted; selection runs everything.
         out["graph_error"] = f"{type(exc).__name__}: {exc}"
-        candidates, importers = {}, {}
+        candidates, importers, notes = {}, {}, []
     out["helper_importers"] = importers
+    out["scope_notes"] = notes
     for source_file in graph_targets:
         found = candidates.get(source_file)
         if found:
@@ -479,12 +498,20 @@ async def _resolve_impacted(
 
 
 async def _graph_candidates(
-    session, repo_id: str, targets: list[str], roots: PytestRoots | None = None
-) -> tuple[dict[str, list], dict[str, list[str]]]:
-    """``{target: [(test file, via), ...]}`` from the graph, and each test file's importers.
+    session,
+    repo_id: str,
+    targets: list[str],
+    roots: PytestRoots | None = None,
+    *,
+    pytest_texts: dict | None = None,
+) -> tuple[dict[str, list], dict[str, list[str]], list[str]]:
+    """``{target: [(test file, via), ...]}`` from the graph, each test file's importers, notes.
 
     Candidates come strongest tier first. The importers map says, for every
-    test file the walk met, which test files import it.
+    test file the walk met, which test files import it. A conftest reached only
+    through its imports stands for the tests it can break
+    (:mod:`repowise.core.analysis.conftest_routes`), read from *pytest_texts*;
+    the notes say what was decided.
 
     One walk per tier for every target rather than one per file: the seed set
     is what makes it cheap. Uncapped, since a trimmed list would drop tests a
@@ -494,15 +521,27 @@ async def _graph_candidates(
     node: a JSON or golden file the index flags as test material is data, not a
     route. A read failure raises.
     """
+    from repowise.core.analysis.conftest_routes import scoped_candidates
     from repowise.core.analysis.test_reachability import load_test_files
-    from repowise.core.analysis.test_selection import is_code_file
+    from repowise.core.analysis.test_selection import is_code_file, plugin_loader
 
+    texts = pytest_texts or {}
     test_files = {f for f in await load_test_files(session, repo_id) if is_code_file(f)}
-    found = await _tier_picks(session, repo_id, targets, test_files, roots)
+    found, entries = await _tier_picks(session, repo_id, targets, test_files, roots)
     seeds = {t for picks in found.values() for t in picks}
-    parents = await _test_importers(session, repo_id, seeds, test_files)
-    out = {target: _with_importers(picks, parents) for target, picks in found.items()}
-    return out, {test: sorted(found_by) for test, found_by in parents.items()}
+    parents, parent_entries = await _test_importers(session, repo_id, seeds, test_files)
+    out, notes = await scoped_candidates(
+        session,
+        repo_id,
+        found,
+        entries,
+        parents,
+        parent_entries,
+        test_files,
+        texts.get,
+        plugin_loader=plugin_loader(texts.items()),
+    )
+    return out, {test: sorted(found_by) for test, found_by in parents.items()}, notes
 
 
 def _all_tests(reached) -> tuple[str, ...]:
@@ -512,8 +551,12 @@ def _all_tests(reached) -> tuple[str, ...]:
 
 async def _tier_picks(
     session, repo_id: str, targets: list[str], test_files: set[str], roots: PytestRoots | None
-) -> dict[str, dict[str, str]]:
-    """``{target: {test file: via}}``: a changed test itself, then the call and import walks."""
+) -> tuple[dict[str, dict[str, str]], dict[str, dict]]:
+    """``{target: {test file: via}}``: a changed test itself, then the call and import walks.
+
+    Also ``{target: {test file: the files it was reached through}}`` from the
+    import walk.
+    """
     from repowise.core.analysis.test_reachability import tests_reaching_by_tier
     from repowise.core.analysis.test_selection import is_runnable_test
 
@@ -527,6 +570,7 @@ async def _tier_picks(
         test_files=test_files,
     )
     found: dict[str, dict[str, str]] = {}
+    entries = {t: dict(r.entries or {}) for t, r in importers.items()}
     for target in targets:
         picks = found.setdefault(target, {})
         # A test the index has not seen yet (new in this change) is still its own pick.
@@ -535,16 +579,20 @@ async def _tier_picks(
         for reached, via in ((reaching.get(target), None), (importers.get(target), "import-graph")):
             for t in _all_tests(reached) if reached else ():
                 picks.setdefault(t, via or reached.via)
-    return found
+    return found, entries
 
 
 async def _test_importers(
     session, repo_id: str, seeds: set[str], test_files: set[str]
-) -> dict[str, set[str]]:
-    """``{test file: test files importing it}``, walked until nothing new appears."""
+) -> tuple[dict[str, set[str]], dict[str, dict]]:
+    """``{test file: test files importing it}``, walked until nothing new appears.
+
+    Also ``{test file: {importer: the files it imports on that route}}``.
+    """
     from repowise.core.analysis.test_reachability import tests_reaching_by_tier
 
     parents: dict[str, set[str]] = {}
+    routes: dict[str, dict] = {}
     frontier, seen = set(seeds), set(seeds)
     while frontier:
         walked = await tests_reaching_by_tier(
@@ -558,19 +606,10 @@ async def _test_importers(
         frontier = set()
         for test, reached in walked.items():
             parents.setdefault(test, set()).update(_all_tests(reached))
+            routes.setdefault(test, {}).update(reached.entries or {})
             frontier.update(set(_all_tests(reached)) - seen)
         seen |= frontier
-    return parents
-
-
-def _with_importers(picks: dict[str, str], parents: dict[str, set[str]]) -> list:
-    """*picks* plus every test importing one of them, transitively, as ``import-graph``."""
-    stack = list(picks)
-    while stack:
-        fresh = [p for p in sorted(parents.get(stack.pop(), ())) if p not in picks]
-        picks.update(dict.fromkeys(fresh, "import-graph"))
-        stack.extend(fresh)
-    return list(picks.items())
+    return parents, routes
 
 
 def _select(repo_path, change, result: dict, config, checkout: _Checkout):
