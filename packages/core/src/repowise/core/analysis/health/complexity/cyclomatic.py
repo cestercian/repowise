@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from .body_facts import BodyTally, step
 from .languages import LanguageNodeMap
 from .models import ConditionComplexity
 
@@ -133,14 +134,33 @@ def _unparen(node: Node | None) -> Node | None:
     return node
 
 
+def _ternary_else_arm(node: Node, lmap: LanguageNodeMap) -> Node | None:
+    """The else-arm of a ternary: its ``alternative`` where the grammar names
+    it, else its last named child.
+
+    A positional grammar (``ternary_arms_positional``) spells the arms as the
+    node's first and last named children instead of ``consequence`` /
+    ``alternative`` fields — Python's ``X if C else Y`` orders them
+    ``X``, ``C``, ``Y``. Locating the else-arm by position lets a chain arm be
+    recognised as flat for those languages too.
+    """
+    arm = node.child_by_field_name("alternative")
+    if arm is not None:
+        return arm
+    if lmap.ternary_arms_positional and node.named_children:
+        return node.named_children[-1]
+    return None
+
+
 def _is_flat_ternary(node: Node, lmap: LanguageNodeMap, in_markup: bool) -> bool:
     """A ternary that chooses rather than nests (see ``flat_ternary_kinds``).
 
     That is one rendered inside JSX, one with a JSX branch, or an arm of a
-    chain (the ``alternative`` of a ternary of its kind). A ternary in another's
-    ``consequence`` still nests: that is a decision inside a decision. Outside
-    markup a branch must itself be JSX, so ``cond ? c2 && <A/> : x`` nests.
-    Like an ``else if``, a flat ternary costs a flat +1 cognitive.
+    chain (the else-arm, per ``_ternary_else_arm``, of a ternary of its kind).
+    A ternary in another's ``consequence`` still nests: that is a decision
+    inside a decision. Outside markup a branch must itself be JSX, so
+    ``cond ? c2 && <A/> : x`` nests. Like an ``else if``, a flat ternary costs
+    a flat +1 cognitive.
     """
     if node.type not in lmap.flat_ternary_kinds:
         return False
@@ -150,7 +170,7 @@ def _is_flat_ternary(node: Node, lmap: LanguageNodeMap, in_markup: bool) -> bool
     while parent is not None and parent.type == "parenthesized_expression":
         parent = parent.parent
     if parent is not None and parent.type == node.type:
-        alternative = _unparen(parent.child_by_field_name("alternative"))
+        alternative = _unparen(_ternary_else_arm(parent, lmap))
         if alternative is not None and alternative.id == node.id:
             return True
     return any(
@@ -301,6 +321,7 @@ def _walk_function_body(
     body_node: Node,
     lmap: LanguageNodeMap,
     deepest: list[int] | None = None,
+    tally: BodyTally | None = None,
 ) -> tuple[int, int, int, int, list[ConditionComplexity]]:
     """Recursive AST walk. Returns (ccn, max_nesting, cognitive, bumps,
     complex_conditions).
@@ -323,6 +344,10 @@ def _walk_function_body(
     :data:`MIN_BLOCK_LINES` lines: where a reader starts flattening it. A
     one-line branch is too small to name as the place to start. Also a
     side-channel only.
+
+    ``tally``, when given, is filled on the same visits by :func:`body_facts.step`.
+    An expression body (``async () => await f()``) is a node the facts read
+    too, so the body root is counted when it is not the function itself.
     """
 
     ccn = 1
@@ -337,14 +362,17 @@ def _walk_function_body(
     deepest_depth = 0
     deepest_node: list[Node] = []
 
-    def _recurse(node: Node, depth: int, in_markup: bool = False) -> None:
+    def _recurse(node: Node, depth: int, in_markup: bool = False, scope: int = 0) -> None:
         nonlocal ccn, max_nesting, cognitive, deepest_depth
 
         # Don't descend into nested function bodies — they're walked
         # separately at the top level. Lambdas / arrow functions DO
         # contribute to the enclosing function's complexity.
-        if node.type in lmap.function_kinds:
+        node_type = node.type
+        if node_type in lmap.function_kinds:
             return
+        if tally is not None and node_type in tally.kinds.watched:
+            scope = step(tally, node, scope)
 
         nesting_increment = 0
         ccn_increment = 0
@@ -447,14 +475,22 @@ def _walk_function_body(
             and node.type not in _MARKUP_VALUE_KINDS
         )
         for child in node.children:
-            _recurse(child, new_depth, child_markup)
+            _recurse(child, new_depth, child_markup, scope)
 
+    root_scope = 0
+    if (
+        tally is not None
+        and body_node.type in tally.kinds.watched
+        and body_node.type not in lmap.function_kinds
+        and body_node.type not in lmap.lambda_kinds
+    ):
+        root_scope = step(tally, body_node, 0)
     for child in body_node.children:
         # Per-child peak depth: temporarily swap max_nesting out so we
         # can read just this child's contribution, then restore.
         outer_max = max_nesting
         max_nesting = 0
-        _recurse(child, 0)
+        _recurse(child, 0, scope=root_scope)
         child_peak = max_nesting
         max_nesting = max(outer_max, child_peak)
         if child_peak >= 2:

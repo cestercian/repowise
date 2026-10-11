@@ -12,10 +12,12 @@ import pytest
 
 from repowise.core.pytest_roots import read_pytest_roots
 from repowise.core.test_paths import (
+    is_skippable_test_path,
     is_test_path,
     is_test_related_path,
     is_test_support_path,
     is_unambiguous_test_path,
+    names_test_for,
 )
 
 # (path, language or None, expected classification)
@@ -104,6 +106,14 @@ _CORPUS: tuple[tuple[str, str | None, str], ...] = (
     ("contest/x.py", None, ""),
     # e2e suites
     ("e2e/login.ts", None, "test"),
+    # ...and the `.e2e.` infix beside `.test.`/`.spec.`, suites and their helpers
+    ("src/gateway/gateway.e2e.ts", None, "test"),
+    ("src/gateway/test-helpers.e2e.ts", None, "test"),
+    ("apps/desktop/tsconfig.e2e.json", None, ""),
+    ("src/harness/e2e_utils.py", None, ""),
+    # one-word suite directories (gcc, flask before 0.11)
+    ("flask/testsuite/basic.py", None, "test"),
+    ("gcc/testsuite/gcc.dg/pr123.c", None, "test"),
     # production code that merely contains the word: the unanchored
     # `test[s_/]` substring rule classified the first three as tests
     ("src/latest/api.py", None, ""),  # #1103 finding 1
@@ -249,6 +259,25 @@ _CORPUS: tuple[tuple[str, str | None, str], ...] = (
     ("Foo.IntegrationTests/Sql/Db.cs", None, "test"),
     ("Foo.IntegrationTests/Helpers/Db.cs", None, "support"),
     ("src/Polly.Testing/ResiliencePipelineExtensions.cs", None, ""),
+    # A name ending in "test" and a scaffolding word is the support for some
+    # module's tests, wherever it sits (openclaw keeps them beside the module).
+    ("extensions/telegram/src/bot.create-telegram-bot.test-harness.ts", None, "support"),
+    ("scripts/test-projects.test-support.mjs", None, "support"),
+    ("extensions/feishu/src/card-test-helpers.ts", None, "support"),
+    ("src/media-understanding/runner.test-mocks.ts", None, "support"),
+    ("extensions/comfy/test-helpers.ts", None, "support"),
+    ("src/cron/isolated-agent.test-setup.ts", None, "support"),
+    # ``test-utils`` is a published entry in React and Preact; ``setup`` alone
+    # is a build script or an app's bootstrap.
+    ("src/test-utils.ts", None, ""),
+    ("packages/react-dom/test-utils.js", None, ""),
+    ("compat/test-utils.mjs", None, ""),
+    ("setup.py", None, ""),
+    ("src/setup.ts", None, ""),
+    ("tests/unit/cli/test_helpers.py", None, "test"),  # a test name stays a test
+    ("src/foo.test-d.ts", None, "test"),  # a type test, not a scaffolding word
+    ("docs/test-helpers.md", None, ""),  # filename rules are source rules
+    ("src/logging/diagnostic-support-bundle.ts", None, ""),
 )
 
 
@@ -280,6 +309,24 @@ def test_related_is_the_union(path: str, language: str | None, expected: str) ->
 @pytest.mark.parametrize("path", ["", ".", "/"])
 def test_degenerate_paths_are_not_tests(path: str) -> None:
     assert not is_test_related_path(path)
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("tests/x.py", True),
+        ("src/__mocks__/api.ts", True),
+        ("pkg/tests/helpers/db.py", True),
+        ("packages/core/src/pkg/core/test_selection.py", False),
+        ("src/bot.test-harness.ts", False),
+        (".github/workflows/tests/run.py", False),
+        ("x.py", False),
+    ],
+)
+def test_in_test_tree_reads_directories_only(path: str, expected: bool) -> None:
+    from repowise.core.test_paths import in_test_tree
+
+    assert in_test_tree(path) is expected
 
 
 def test_windows_separators_match_posix() -> None:
@@ -339,6 +386,28 @@ def test_unambiguous_test_paths_need_more_than_a_test_shaped_name_under_src(
     assert is_unambiguous_test_path(path) is expected
 
 
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("tests/api/openapi.yaml", True),
+        ("Foo.Tests/Clients/Orders.cs", True),
+        ("src/api/client.test.ts", True),
+        ("src/__mocks__/api.ts", True),
+        ("pkg/server/handler_test.go", True),
+        # non-source files need a named test tree
+        ("Foo.Specs/openapi.yaml", False),
+        ("spec/support/openapi.yaml", False),
+        ("testdata/openapi.yaml", False),
+        # a PascalCase suite folder alone, or a Python test name under src
+        ("LoadTests/Runner.cs", False),
+        ("src/api/test_routes.py", False),
+        ("src/app/main.ts", False),
+    ],
+)
+def test_skippable_test_paths_never_drop_a_possible_contract(path: str, expected: bool) -> None:
+    assert is_skippable_test_path(path) is expected
+
+
 _ROOTS = read_pytest_roots(
     [("pyproject.toml", '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n')]
 )
@@ -367,3 +436,29 @@ def test_pytest_config_overrules_a_test_shaped_python_name(path: str, expected: 
     assert got == expected
     # Without the config the name decides, as it does for a bare pytest.
     assert is_test_related_path(path)
+
+
+@pytest.mark.parametrize(
+    ("test_path", "source", "siblings", "named"),
+    [
+        ("tests/test_loader.py", "src/loader.py", (), True),
+        ("tests/test_attention_golden.py", "src/attention.py", (), True),
+        ("tests/test_loaders.py", "src/loader.py", (), False),
+        ("tests/test_foo_bar.py", "src/foo.py", (), True),
+        # A sibling the qualified name names exactly is that file's test.
+        ("tests/test_foo_bar.py", "src/foo.py", ("src/foo_bar.py",), False),
+        ("tests/test_foo_bar.py", "src/foo_bar.py", ("src/foo.py",), True),
+        ("src/attempt.spawn-workspace.test.ts", "src/attempt.ts", (), True),
+        # Multi-dot stems keep PurePath semantics in both directions.
+        ("src/foo.test.ts", "src/foo.config.ts", (), False),
+        ("src/foo.config.test.ts", "src/foo.config.ts", (), True),
+        ("src/foo.config.test.ts", "src/foo.ts", ("src/foo.config.ts",), False),
+        ("pkg/foo_bar_test.go", "pkg/foo.go", (), True),
+        ("pkg/foo_bar_test.go", "pkg/foo.go", ("pkg/foo_bar.go",), False),
+        ("src/FooBarTest.java", "src/Foo.java", (), True),
+        ("src/FooBarTests.cs", "src/Foo.cs", ("src/FooBar.cs",), False),
+        ("src/Footest.java", "src/Foo.java", (), False),
+    ],
+)
+def test_a_test_named_for_a_file_may_carry_a_qualifier(test_path, source, siblings, named):
+    assert names_test_for(test_path, source, siblings) is named

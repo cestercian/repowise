@@ -41,6 +41,11 @@ from repowise.cli.helpers import (
     write_update_pending,
 )
 from repowise.core.docs_mode import docs_mode_state_fields, resolve_docs_mode
+from repowise.core.ingestion.git_indexer import (
+    GIT_HISTORY_VERSION,
+    GIT_HISTORY_VERSION_KEY,
+    git_history_stale,
+)
 from repowise.core.pipeline import PhaseTimings, timed
 from repowise.core.reasoning import REASONING_MODES
 
@@ -62,6 +67,7 @@ from .persistence import (
     heal_commit_offsets,
     health_analyzer_changed,
     parser_changed,
+    refresh_read_snapshots,
     stamp_head_commit,
 )
 from .reporting import (
@@ -179,6 +185,23 @@ def _record_update_outcome(
         telemetry.add_command_outcome(**{k: v for k, v in outcome.items() if v is not None})
     except Exception:
         return
+
+
+def _finish_outcome(
+    repo_path: Any,
+    agents_md: bool | None,
+    degraded: list[str] | None = None,
+    *,
+    write: bool = True,
+    timings: PhaseTimings | None = None,
+) -> None:
+    """Every update outcome ends here: the stored read views, then the editor
+    files that quote them. ``write=False`` (a dry run) skips the views."""
+    if write:
+        with timed(timings, "read_snapshots"):
+            refresh_read_snapshots(repo_path)
+    with timed(timings, "editor_files"):
+        _refresh_editor_stamp(repo_path, agents_md, degraded)
 
 
 def _refresh_editor_stamp(
@@ -994,6 +1017,10 @@ def run_update(
         _repair_module_attribution(repo_path)
 
     analyzer_changed = health_analyzer_changed(state)
+    # Stored per-file git rows written under older history rules. Only a full
+    # walk rewrites the rows of files no commit touched, so this forces one
+    # (and nothing else: no page is regenerated for it).
+    history_stale = git_history_stale(state)
     git_is_current = bool(
         head
         and head == base_ref
@@ -1001,6 +1028,7 @@ def run_update(
         and not renderer_changed
         and not working_tree_diffs
         and not analyzer_changed
+        and not history_stale
     )
     # The parse is read from the store, so it is asked only when git and the
     # analyzer would otherwise let the run exit.
@@ -1015,6 +1043,11 @@ def run_update(
             "[yellow]Health analyzer changed since this index was scored; re-scoring.[/yellow]"
             if analyzer_changed
             else "[yellow]Parser changed since this index was built; re-parsing.[/yellow]"
+        )
+    if history_stale:
+        console.print(
+            "[yellow]Git history rules changed since this index was built; "
+            "re-reading the full history once.[/yellow]"
         )
     # A page can be stale for a reason no commit explains: a cascade that ran
     # out of budget, an interrupted run, an expiry. Git says nothing changed,
@@ -1081,7 +1114,7 @@ def run_update(
                     # A capture added after this repo was indexed would otherwise wait
                     # for the next commit to land, which on a quiet repo is never.
                     heal_commit_offsets(repo_path)
-                    _refresh_editor_stamp(repo_path, agents_md)
+                    _finish_outcome(repo_path, agents_md)
                     # The index is current, so any pending marker a bailed update left
                     # is by definition caught-up (or older); drop it here too rather
                     # than waiting for the next content-changing update. This is the
@@ -1290,6 +1323,7 @@ def run_update(
         and not renderer_changed
         and not analyzer_changed
         and not extraction_changed
+        and not history_stale
         and not stale_db_paths
         and not stale_deterministic_ids
     ):
@@ -1325,7 +1359,7 @@ def run_update(
         # This path skips the git phase, so its offset backfill never runs.
         if not dry_run:
             heal_commit_offsets(repo_path)
-        _refresh_editor_stamp(repo_path, agents_md)
+        _finish_outcome(repo_path, agents_md, write=not dry_run)
         # We hold the lock and have advanced to head; drop any stale pending
         # marker a bailed update left behind.
         consume_update_pending(repo_path, head)
@@ -1358,6 +1392,7 @@ def run_update(
         and not file_diffs
         and not git_config_changed
         and not generation_config_changed
+        and not history_stale
     ):
         if dry_run:
             action = (
@@ -1408,7 +1443,7 @@ def run_update(
         # `.git` pointer (the same helper the MCP reader uses). A path that
         # is not a checkout still leaves a stored commit untouched, because a
         # missed read never blanks one.
-        _refresh_editor_stamp(repo_path, agents_md)
+        _finish_outcome(repo_path, agents_md)
         consume_update_pending(repo_path, head)
         if emitter is not None:
             emitter.done(
@@ -1455,6 +1490,7 @@ def run_update(
             or renderer_changed
             or analyzer_changed
             or extraction_changed
+            or history_stale
         )
     )
     head_ts = None if working_tree_only else _head_commit_ts(repo_path)
@@ -1468,7 +1504,7 @@ def run_update(
             include_submodules=bool(state.get("include_submodules", False)),
             include_nested_repos=bool(state.get("include_nested_repos", False)),
             idle_decay_sink=None if working_tree_only else git_decay_map,
-            force_full_git=git_config_changed,
+            force_full_git=git_config_changed or history_stale,
             git_summary_sink=full_git_summaries,
             timings=timings,
         )
@@ -1789,6 +1825,10 @@ def run_update(
                 head_ts=head_ts,
                 force_full_rescore=health_config_changed,
                 full_git_summary=(full_git_summaries[0] if full_git_summaries else None),
+                # Only a history-window change invalidates mined decisions and
+                # per-commit health; a walk forced by the history-rules stamp
+                # keeps both.
+                history_window_changed=git_config_changed,
                 reconcile_full_scope=traversal_config_changed,
                 full_generation_page_ids=(
                     {page.page_id for page in det_pages}
@@ -1804,7 +1844,7 @@ def run_update(
             if emitter is not None:
                 emitter.error(str(exc))
             raise
-        _refresh_editor_stamp(repo_path, agents_md, degraded)
+        _finish_outcome(repo_path, agents_md, degraded)
         # Index-only is the post-commit hook's hot path; clear any stale pending
         # marker here too, not just on the full-docs path.
         consume_update_pending(repo_path, head)
@@ -2444,6 +2484,7 @@ def run_update(
                 reconcile_full_generation=generation_config_changed,
                 require_config_rebuild_success=config_rebuild_required,
                 require_decision_persist_success=git_config_changed,
+                history_window_changed=git_config_changed,
                 timings=timings,
             )
     except Exception as exc:
@@ -2497,9 +2538,8 @@ def run_update(
             if run_full_security_rescan(repo_path, exclude_patterns):
                 state["security_scanner_version"] = SECURITY_SCANNER_VERSION
 
-    # ---- Editor project files (best-effort) ----
-    with timed(timings, "editor_files"):
-        _refresh_editor_stamp(repo_path, agents_md, degraded)
+    # ---- Stored read views, then the editor files that quote them ----
+    _finish_outcome(repo_path, agents_md, degraded, timings=timings)
 
     # Update state
     from repowise.cli.helpers import config_fingerprint
@@ -2537,6 +2577,8 @@ def run_update(
             state["git_history_coverage"] = coverage.to_dict()
         else:
             state.pop("git_history_coverage", None)
+        # Every row was rewritten under the current rules.
+        state[GIT_HISTORY_VERSION_KEY] = GIT_HISTORY_VERSION
     save_state(repo_path, state)
 
     # --- Pending-marker cleanup --------------------------------------------

@@ -208,11 +208,20 @@ def test_file_namers_lists_every_file_naming_one() -> None:
         ("web/src/more.ts", '"layout.css"\n'),
     ]
     files = ["web/src/styles/layout.css", "other/layout.css"]
+    # An asset may be included by another asset, so its name alone names it.
     assert file_namers(files, sources)["other/layout.css"] == [
         "web/src/app.ts",
         "src/other.py",
         "web/src/more.ts",
     ]
+    # A manifest is named only where a written directory can lead to it.
+    manifests = ["web/package.json", "other/package.json"]
+    code = [("web/src/app.ts", "open('./web/package.json')"), ("x.py", '"package.json"')]
+    exact = file_namers(manifests, code, lambda f: f.endswith("package.json"))
+    assert exact == {
+        "web/package.json": ["web/src/app.ts", "x.py"],
+        "other/package.json": ["x.py"],
+    }
 
 
 def test_a_js_package_manifest_runs_its_tests_and_those_reaching_its_code() -> None:
@@ -292,3 +301,105 @@ def test_unplaced_tests_run_with_a_scoped_selection() -> None:
 
 def test_scope_paths_are_posix() -> None:
     assert all(PurePosixPath(p).as_posix() == p for p in _TRACKED)
+
+
+def _namer_checkout(tmp_path):
+    """A git checkout where one changed name sits inside another (``a.md`` in ``data.md``)."""
+    import subprocess
+
+    from repowise.core.analysis.changed_lines import ChangeSet, FileDiff
+    from repowise.core.analysis.test_collection import read_checkout
+
+    files = {
+        "web/package.json": "{}",
+        "web/src/app.ts": "import pkg from '../package.json'\n",
+        "web/src/app.test.ts": "readFileSync('package.json')\n",
+        "tools/build.py": "print('web/package.json', 'README.md')\n",
+        "tools/data.py": "open('docs/data.md')\n",
+        "tools/upper.py": "open('WEB/PACKAGE.JSON')\n",
+        "docs/a.md": "# a\n",
+        "docs/data.md": "# data\n",
+        "src/mod.py": "x = 1\n",
+        "pytest.ini": "[pytest]\naddopts = --doctest-glob=*.md\n",
+        "README.md": "readme\n",
+    }
+    for path, text in files.items():
+        (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / path).write_text(text, encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+    changed = ("web/package.json", "README.md", "docs/a.md", "docs/data.md")
+    change = ChangeSet(
+        files={p: FileDiff(path=p) for p in changed},
+        deleted=set(),
+        label="t",
+        base=None,
+        head=None,
+    )
+    return change, read_checkout(tmp_path)
+
+
+def test_plan_scopes_names_the_same_files_from_git_grep_as_from_reading_them(tmp_path) -> None:
+    """The grep only skips reading files that hold no changed name; nested names still count."""
+    from dataclasses import replace
+
+    from repowise.core.analysis.test_collection import plan_scopes
+
+    change, checkout = _namer_checkout(tmp_path)
+    assert checkout.holding is not None
+    grepped = plan_scopes(change, _NONE, checkout)
+    assert grepped == plan_scopes(change, _NONE, replace(checkout, holding=None))
+    # The name is matched ignoring case, in the grep and in the read alike.
+    assert grepped.namers["web/package.json"] == [
+        "tools/build.py",
+        "tools/upper.py",
+        "web/src/app.test.ts",
+        "web/src/app.ts",
+    ]
+    # "data.md" holds "a.md": a doc keeps name-only matching, so both are named.
+    assert grepped.namers["docs/a.md"][-1] == "tools/data.py"
+    assert grepped.namers["docs/data.md"][-1] == "tools/data.py"
+
+
+def test_a_grep_that_cannot_answer_falls_back_to_reading_every_file(
+    tmp_path, monkeypatch
+) -> None:
+    from dataclasses import replace
+
+    from repowise.core.analysis import test_collection
+    from repowise.core.analysis.doc_drift import suggest
+
+    change, checkout = _namer_checkout(tmp_path)
+    read = test_collection.plan_scopes(change, _NONE, replace(checkout, holding=None))
+    monkeypatch.setattr(suggest, "git_run", lambda *_a, **_k: None)  # timed out
+    assert test_collection.plan_scopes(change, _NONE, checkout) == read
+
+
+def test_a_blob_read_that_stops_early_does_not_read_as_unmoved(tmp_path) -> None:
+    """A path left out of a blob read counts as unread only where the file exists."""
+    import subprocess
+
+    from repowise.core.analysis.test_collection import _unread
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=tmp_path, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (tmp_path / "kept.py").write_text("import os\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-q", "-m", "one")
+    old = git("rev-parse", "HEAD")
+    (tmp_path / "added.py").write_text("import sys\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-q", "-m", "two")
+    new = git("rev-parse", "HEAD")
+
+    specs = [(old, "kept.py"), (new, "kept.py"), (old, "added.py"), (new, "added.py")]
+    whole = {(old, "kept.py"): b"x", (new, "kept.py"): b"x", (new, "added.py"): b"y"}
+    assert _unread(tmp_path, specs, whole) == set()  # added.py is absent at old
+    assert _unread(tmp_path, specs, {(old, "kept.py"): b"x"}) == {"kept.py", "added.py"}
+    assert _unread(tmp_path, specs, None) == set()  # nothing read: the caller fails closed

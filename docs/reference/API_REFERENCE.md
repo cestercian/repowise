@@ -416,11 +416,11 @@ repo (`routers/search.py`).
 
 ### 5.4 Pagination
 
-`limit`/`offset` is the convention (39 operations take `limit`, 19 take
+`limit`/`offset` is the convention (41 operations take `limit`, 18 take
 `offset`), with a per-route maximum in the schema. The page-shaped responses
 that need to tell a client whether more exists return an explicit
 `{total, offset, has_more, next_offset}` instead, e.g.
-`GET /api/repos/{repo_id}/refactoring/targets/page`. `GET /api/pages` accepts a
+`GET /api/repos/{repo_id}/refactoring/opportunities`. `GET /api/pages` accepts a
 `limit` up to 5000, which is the one route where a full listing is a realistic
 request.
 
@@ -453,8 +453,8 @@ deployment with no local checkout:
   recorded are servable, and `.git`/`.repowise` paths are refused),
   `POST /api/repos/{id}/preflight`,
   `POST /api/repos/{id}/refactoring/{suggestion_id}/generate-code`
-  (`404` without an accessible checkout, `403` when `refactoring.llm.enabled`
-  is false)
+  (`404` without an accessible checkout, `403` unless `refactoring.llm.enabled`
+  is true)
 - validate the path at registration: `POST /api/repos` rejects a `local_path`
   that is not an existing git directory with a `422` body
 

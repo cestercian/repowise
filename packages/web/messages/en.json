@@ -19,6 +19,8 @@
     "switched": "Language switched to {language}"
   },
   "shell": {
+    "switchToDarkTheme": "Switch to dark theme",
+    "switchToLightTheme": "Switch to light theme",
     "skipToContent": "Skip to content",
     "expandSidebar": "Expand sidebar",
     "collapseSidebar": "Collapse sidebar",
@@ -84,6 +86,7 @@
       "loading": "Loading Repowise"
     },
     "reindexHint": {
+      "label": "Reindex",
       "body": "This index was built by an older repowise. It still works, but a reindex is recommended to pick up the latest format."
     },
     "whatsNewModal": {
@@ -146,8 +149,17 @@
     "files": "Files"
   },
   "errors": {
+    "workspaceErrorTitle": "Failed to load the workspace",
+    "workspaceErrorFallback": "Could not load workspace data. The backend may be unavailable.",
+    "settingsErrorTitle": "Failed to load settings",
+    "settingsErrorFallback": "Could not load settings. The backend may be unavailable.",
     "notFoundTitle": "Page not found",
     "notFoundBody": "The page you requested doesn't exist. It may have been moved or never existed.",
+    "notFoundLinks": "Try one of these",
+    "notFoundSearchHint": "Or press <kbd>Ctrl K</kbd> (<kbd>⌘ K</kbd> on Mac) to search.",
+    "repoOverview": "Repository overview",
+    "repoCodeHealth": "Code health",
+    "repoDocs": "Docs",
     "backToDashboard": "Back to dashboard",
     "errorTitle": "Something went wrong",
     "errorFallback": "An unexpected error occurred. Please try again.",
@@ -218,10 +230,12 @@
       "description": "The things about this codebase you can't see anywhere else: how big it got, when it started, when the work happens, and the records it holds."
     },
     "commits": {
+      "emptyTitle": "No scored commits yet",
+      "emptyAction": "Go to overview",
       "title": "Commits",
       "description": "Every commit scored for change-risk against this repo's own history, so 'elevated' means elevated here rather than on some global curve.",
       "emptyDescription": "Every commit scored for change-risk against this repo's own history.",
-      "emptyHint": "Per-commit change-risk is captured on the next full index. Run a sync and the review queue fills in behind it.",
+      "emptyHint": "Per-commit change risk is captured on the next full index. Run a sync from the overview and the review queue fills in behind it.",
       "reviewQueueTitle": "Review queue",
       "reviewQueueDescription": "Newest first by default. Priority is a tercile of this repo's own distribution, so sorting by it shows only the top third — the filters narrow the whole repository, not the page.",
       "scoreBehaviourTitle": "How the score behaves here",
@@ -231,7 +245,6 @@
       "evolutionDescription": "Commit categories over time, read off the subject line. Fixes carry the accent because that is the series this chart exists to show."
     },
     "architecture": {
-      "couplingTitle": "Change coupling",
       "tabs": {
         "map": "Map",
         "coupling": "Coupling",
@@ -255,6 +268,8 @@
       "notIndexed": "Not indexed yet",
       "snapshots": "{count, plural, one {# snapshot} other {# snapshots}}",
       "coChangeNoticeTitle": "Health scores changed in this release.",
+      "coChangeNoticeMore": "What changed",
+      "coChangeNoticeLess": "Hide",
       "coChangeNoticeBody": "Co-change coupling is now measured relative to your repository and decays with commit history rather than calendar time, so roughly one file in ten moves a band. Scores are not comparable to snapshots taken before this release.",
       "tabs": {
         "triage": "Overview",
@@ -280,6 +295,9 @@
       "promptDescription": "A ready-to-paste plan that hands your AI coding agent the ordered steps, which of them are mechanical, the evidence behind the diagnosis, and the id to query it back.",
       "loading": "Loading refactoring opportunities",
       "loadFailed": "Couldn't load refactoring opportunities. The repo may not be indexed yet, or the API is unreachable.",
+      "loadFailedTitle": "Couldn't load refactoring",
+      "unavailableTitle": "Refactoring analysis has not run yet",
+      "unavailableDescription": "Run repowise update in this repository to analyse it. Opportunities appear here once the health pass has finished.",
       "tabAll": "All",
       "tabStructural": "Structural",
       "sectionTitleAll": "All opportunities",
@@ -308,11 +326,16 @@
       "profileTitle": "Contributor",
       "profileEmptyTitle": "No profile for this contributor",
       "profileEmptyDescription": "Nobody by this name or address appears in the indexed git history. They may have committed under a different address, or the history may not have been synced yet.",
+      "profileBack": "All contributors",
+      "loadFailedTitle": "Couldn't load contributors",
+      "loadFailed": "The contributor list could not be loaded. Check that the API is reachable and try again.",
       "tenureSince": "Committing here since {date}",
       "tenureLastTouched": "last touched {time}",
       "unknownName": "unknown"
     },
     "costs": {
+      "spendEmptyTitle": "No model calls recorded yet",
+      "spendEmptyDescription": "Nothing has been spent on this repository. Model spend appears here once Repowise generates docs or answers with a model.",
       "title": "Usage & savings",
       "description": "What agents avoided, what Repowise cost, and how we know.",
       "savingsErrorTitle": "Couldn't load agent savings",
@@ -360,6 +383,7 @@
       "footer": "Sync schedule, exclude patterns and deletion are per repository, on <link>the repository page</link>."
     },
     "workspace": {
+      "emptyAction": "Read the quickstart",
       "title": "Workspace",
       "description": "Every repository registered in this workspace, and what connects them.",
       "emptyTitle": "No repositories discovered yet",
@@ -417,6 +441,8 @@
       }
     },
     "docsFreshness": {
+      "loadErrorTitle": "Couldn't load documentation pages",
+      "loadErrorBody": "The backend did not return this repository's pages. Reload to try again.",
       "title": "Doc freshness",
       "header": "Freshness across {count} pages",
       "freshPct": "{pct}% of pages are fresh",
@@ -784,6 +810,26 @@
     }
   },
   "risk": {
+    "posture": {
+      "figure": "In shipped source",
+      "figureHint": "Pattern matches outside test, spec, fixture, mock, example and docs paths. These are the ones to confirm first.",
+      "unit": "of {count, plural, one {# finding} other {# findings}}",
+      "unitCapped": "of {total}+ findings",
+      "sentenceSource": "The pattern scan for secrets and dangerous calls matched {count, plural, one {# place} other {# places}} in shipped source, {high} of them high.",
+      "sentenceElsewhere": "{count, plural, one {# more is} other {# more are}} in tests and docs, listed after shipped code.",
+      "sentenceNoSource": "Nothing matched in shipped source. {count, plural, one {The one match is} other {All # matches are}} in tests and docs, listed so you can confirm they are fixtures.",
+      "scanned": "Scanned {when}.",
+      "scanTimeUnknown": "Scan time not recorded.",
+      "loading": "Loading security findings",
+      "retry": "Retry",
+      "clearTitle": "No security findings",
+      "clearBody": "The pattern scan for secrets and dangerous calls matched nothing in source, tests or docs. Scanned {when}.",
+      "notScannedTitle": "Not scanned yet",
+      "notScannedBody": "The pattern scan for secrets and dangerous calls runs when the repository syncs. Start one with Re-scan, or run repowise update in the repository.",
+      "capped": "Showing the first {count} findings. The counts on this page cover those {count}.",
+      "byDirectory": "By directory",
+      "byDirectoryBody": "Where the matches concentrate, busiest directories first."
+    },
     "analysisTimeout": "Analysis is taking longer than expected. Reload to see the results.",
     "syncStarted": "Sync started — findings refresh when it completes",
     "syncFailed": "Couldn't start a sync",
@@ -1132,6 +1178,13 @@
     }
   },
   "loading": {
+    "workspace": "Loading workspace",
+    "settings": "Loading settings",
+    "docs": "Loading documentation",
+    "overview": "Loading overview",
+    "file": "Loading file",
+    "symbol": "Loading symbol",
+    "page": "Loading page",
     "repo": "Loading",
     "architecture": "Loading architecture",
     "commits": "Loading commits",

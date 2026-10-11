@@ -63,13 +63,18 @@ from pathlib import PurePath, PurePosixPath
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Collection
+
     from .pytest_roots import PytestRoots
 
 # Directory segments that mark every file beneath them as test material,
 # whatever the filename. ``__test__`` is the Jest variant of ``__tests__``;
-# ``integration_test`` is the directory Flutter's integration tests must live in.
+# ``integration_test`` is the directory Flutter's integration tests must live in;
+# ``testsuite`` is the one-word suite directory (``gcc/testsuite/``, ``flask/testsuite/``).
+# Ceiling: a product package named ``testsuite`` (a library for running suites)
+# reads as test material too; none seen so far.
 _TEST_DIR_TOKENS: frozenset[str] = frozenset(
-    {"test", "tests", "__tests__", "__test__", "e2e", "integration_test"}
+    {"test", "tests", "__tests__", "__test__", "e2e", "integration_test", "testsuite"}
 )
 
 # A compound segment (``e2e-tests``, ``pkg_tests``, ``client-e2e``) is a test
@@ -170,6 +175,16 @@ _SUPPORT_DIR_TOKENS_ANYWHERE: frozenset[str] = frozenset(
 )
 
 
+# A source file whose name ends in "test" and a scaffolding word is the support
+# for some module's tests: ``bot.test-harness.ts``, ``card-test-helpers.ts``,
+# ``test-support.mjs``. Words split as directory segments do. Not ``spec``,
+# which ``spec_utils.py`` uses for OpenAPI tooling, and not ``utils``: React
+# and Preact publish ``test-utils.js`` as a package entry.
+_SUPPORT_NAME_WORDS: frozenset[str] = frozenset(
+    {"harness", "support", "helper", "helpers", "mock", "mocks", "fixture", "fixtures", "setup"}
+)
+
+
 @dataclass(frozen=True, slots=True)
 class _Conventions:
     """The registry-declared halves of the rules, resolved once."""
@@ -186,6 +201,7 @@ class _Conventions:
     dir_paths: tuple[tuple[str, ...], ...]
     dir_wildcards: tuple[tuple[str, str], ...]
     dir_suffixes: tuple[str, ...]
+    unambiguous_dir_suffixes: tuple[str, ...]
     lang_dir_tokens: dict[str, frozenset[str]]
 
 
@@ -222,6 +238,12 @@ def _conventions() -> _Conventions:
         ),
         # Case-sensitive .NET sibling project dirs (Foo.Tests/, Foo.Specs/).
         dir_suffixes=REGISTRY.test_dir_suffixes(),
+        # Without the ``spec`` forms, which also name specification projects.
+        unambiguous_dir_suffixes=tuple(
+            s
+            for s in REGISTRY.test_dir_suffixes()
+            if s.lstrip(".").lower() not in _AMBIGUOUS_TEST_DIR_TOKENS
+        ),
         lang_dir_tokens=REGISTRY.test_dir_tokens_by_language(),
     )
 
@@ -281,10 +303,23 @@ def _is_support_name(filename: str) -> bool:
         return False
     rules = _conventions()
     lowered = filename.lower()
-    if PurePosixPath(lowered).stem in rules.support_stems:
+    if PurePosixPath(lowered).stem in rules.support_stems or _is_support_compound(filename):
         return True
     camel_re = rules.support_camel_res.get(PurePosixPath(lowered).suffix)
     return camel_re is not None and camel_re.search(PurePosixPath(filename).stem) is not None
+
+
+def _is_support_compound(filename: str) -> bool:
+    """``x.test-harness.ts``: a test name (``test_utils.py``) stays a test."""
+    lowered = PurePosixPath(filename.lower())
+    words = _words(lowered.stem)
+    return (
+        len(words) >= 2
+        and words[-2] == "test"
+        and words[-1] in _SUPPORT_NAME_WORDS
+        and lowered.suffix in _conventions().source_exts
+        and not _is_test_name(filename)
+    )
 
 
 def _is_test_dir(
@@ -292,7 +327,7 @@ def _is_test_dir(
 ) -> bool:
     """Whether any directory segment marks this path as sitting in a test tree."""
     return _has_test_segment(segments, original, filename, language) or _has_test_layout(
-        segments, original
+        segments, original, _conventions().dir_suffixes
     )
 
 
@@ -317,16 +352,24 @@ def _has_test_segment(
 
 
 def _is_test_segment(seg: str, orig: str, lang_tokens: frozenset[str], corroborated: bool) -> bool:
+    if _is_named_test_dir(seg):
+        return True
     words = _words(seg)
     head = words[-1] if words else ""
-    if seg in _TEST_DIR_TOKENS or head in _TEST_DIR_HEAD_WORDS:
-        return True
     if head in _AMBIGUOUS_TEST_DIR_TOKENS and (head in lang_tokens or corroborated):
         return True
     return _CAMEL_TESTS_HEAD_RE.search(orig) is not None
 
 
-def _has_test_layout(segments: list[str], original: list[str]) -> bool:
+def _is_named_test_dir(seg: str) -> bool:
+    """Whether a directory's name alone says it holds tests (``tests``, ``e2e-tests``)."""
+    words = _words(seg)
+    return seg in _TEST_DIR_TOKENS or (bool(words) and words[-1] in _TEST_DIR_HEAD_WORDS)
+
+
+def _has_test_layout(
+    segments: list[str], original: list[str], dir_suffixes: tuple[str, ...]
+) -> bool:
     """Whether the directories form a known test layout (``src/test/java``)."""
     rules = _conventions()
     return (
@@ -337,7 +380,7 @@ def _has_test_layout(segments: list[str], original: list[str]) -> bool:
             _has_wildcard_pair(segments, original, prefix_seg, camel_suffix)
             for prefix_seg, camel_suffix in rules.dir_wildcards
         )
-        or any(seg.endswith(rules.dir_suffixes) for seg in original)
+        or any(seg.endswith(dir_suffixes) for seg in original)
     )
 
 
@@ -467,6 +510,21 @@ def is_test_related_path(
     return _classify(path, language, roots) != ""
 
 
+def in_test_tree(path: str, language: str | None = None) -> bool:
+    """Whether a directory alone makes *path* test material, whatever its name.
+
+    ``tests/x.py`` and ``src/__mocks__/api.ts`` are; ``core/test_selection.py``
+    is test-shaped only by name. ``.github/`` makes no test tree.
+    """
+    original, lowered = _parts(path)
+    segments = lowered[:-1]
+    if not segments or _REPO_METADATA_DIR in segments:
+        return False
+    return any(_is_support_anywhere_dir(seg) for seg in segments) or _is_test_dir(
+        segments, original[:-1], "", language
+    )
+
+
 def is_unambiguous_test_path(path: str, language: str | None = None) -> bool:
     """Whether *path* is test material beyond a naming coincidence.
 
@@ -483,6 +541,39 @@ def is_unambiguous_test_path(path: str, language: str | None = None) -> bool:
     if _is_test_dir(lowered[:-1], original[:-1], original[-1], language):
         return True
     return "src" not in lowered[:-1]
+
+
+def is_skippable_test_path(path: str) -> bool:
+    """Whether a scan that drops test material should drop *path*.
+
+    For callers that skip files outright, such as contract extraction, where a
+    wrong yes silently loses a real contract. Stricter than
+    :func:`is_test_related_path` in three ways:
+
+    - A non-source file (``openapi.yaml``, ``api.proto``) counts only inside a
+      named test tree (``tests/``, ``e2e/``, ``src/test/java``, ``Foo.Tests/``):
+      not under ``spec/``, ``testdata/``, ``Foo.Specs/`` or ``LoadTests/``.
+    - A source file needs a named test tree, a test or support filename, or a
+      ``__mocks__``-style dir; a PascalCase ``LoadTests/`` folder is not enough.
+    - Under ``src``, a Python test-shaped name alone does not count
+      (``src/api/test_routes.py``), as in :func:`is_unambiguous_test_path`;
+      other toolchains' names (``client.test.ts``, ``FooTest.kt``) still do.
+    """
+    if not is_test_related_path(path):
+        return False
+    original, lowered = _parts(path)
+    filename, segments = original[-1], lowered[:-1]
+    rules = _conventions()
+    if any(_is_named_test_dir(seg) for seg in segments) or _has_test_layout(
+        segments, original[:-1], rules.unambiguous_dir_suffixes
+    ):
+        return True
+    ext = PurePosixPath(filename.lower()).suffix
+    if ext not in rules.source_exts:
+        return False
+    if _is_support_name(filename) or any(_is_support_anywhere_dir(seg) for seg in segments):
+        return True
+    return _is_test_name(filename) and (ext != ".py" or "src" not in segments)
 
 
 def is_test_to_production_pair(
@@ -509,29 +600,77 @@ _CLASS_TEST_SUFFIXES: dict[str, tuple[str, ...]] = {
 }
 
 
+_JS_TEST_TAILS = (
+    ".test.ts",
+    ".test.tsx",
+    ".test.js",
+    ".test.mts",
+    ".test.cts",
+    ".spec.ts",
+    ".spec.js",
+    ".spec.mts",
+    ".spec.cts",
+)
+
+
+def _paired_affixes(p: PurePath) -> list[tuple[str, str]]:
+    """``(before the stem, after the stem)`` of every conventional test name for *p*."""
+    test_suffix = ".exs" if p.suffix == ".ex" else p.suffix
+    return [
+        ("test_", test_suffix),
+        ("", f"_test{test_suffix}"),
+        ("", f"_spec{test_suffix}"),
+        *(("", tail) for tail in _JS_TEST_TAILS),
+        *(("", f"{suffix}{p.suffix}") for suffix in _CLASS_TEST_SUFFIXES.get(p.suffix, ())),
+    ]
+
+
 def paired_test_names(rel_path: str) -> frozenset[str]:
     """Filenames a test for *rel_path* would conventionally carry, any directory."""
     p = PurePath(rel_path)
     stem = p.stem
-    test_suffix = ".exs" if p.suffix == ".ex" else p.suffix
-    names = {
-        f"test_{stem}{test_suffix}",
-        f"{stem}_test{test_suffix}",
-        f"{stem}_spec{test_suffix}",
-        f"{stem}.test.ts",
-        f"{stem}.test.tsx",
-        f"{stem}.test.js",
-        f"{stem}.test.mts",
-        f"{stem}.test.cts",
-        f"{stem}.spec.ts",
-        f"{stem}.spec.js",
-        f"{stem}.spec.mts",
-        f"{stem}.spec.cts",
-    }
+    names = {f"{head}{stem}{tail}" for head, tail in _paired_affixes(p)}
     if p.suffix.lower() in _PASCAL_UNIT_SUFFIXES:
         # Delphi pairs ``uFoo.pas`` with a ``TestFoo.dpr`` program; only a
         # lowercase ``u`` is the unit prefix (``Utils.pas`` keeps its U).
         names.add(f"Test{stem[1:] if stem[:1] == 'u' else stem}.dpr")
-    for suffix in _CLASS_TEST_SUFFIXES.get(p.suffix, ()):
-        names.add(f"{stem}{suffix}{p.suffix}")
     return frozenset(names)
+
+
+def _qualified_name(test_name: str, rel_path: str) -> bool:
+    """*test_name* is a paired name for *rel_path* with a qualifier after the stem."""
+    p = PurePath(rel_path)
+    for head, tail in _paired_affixes(p):
+        lead = f"{head}{p.stem}"
+        if len(test_name) <= len(lead) + len(tail) + 1:
+            continue
+        if not (test_name.startswith(lead) and test_name.endswith(tail)):
+            continue
+        middle = test_name[len(lead) : len(test_name) - len(tail)]
+        # ``_golden``, ``.retry``, ``-cli``; or a PascalCase word before ``Test``.
+        if middle[0] in "._-" or (middle[0].isupper() and tail[:1].isupper()):
+            return True
+    return False
+
+
+def names_test_for(test_path: str, rel_path: str, siblings: Collection[str] = ()) -> bool:
+    """Whether *test_path* is named for *rel_path*: a paired name, or one with a
+    qualifier after the stem (``test_loader_golden.py``, ``loader.retry.test.ts``,
+    ``loader_retry_test.go``, ``LoaderRetryTest.java``).
+
+    *siblings* are the other files in *rel_path*'s directory. A qualified name
+    one of them claims is that file's test: ``test_foo_bar.py`` is for
+    ``foo_bar.py``, not ``foo.py``, and ``foo.config.test.ts`` for ``foo.config.ts``.
+    """
+    name = PurePath(test_path).name
+    if name in paired_test_names(rel_path):
+        return True
+    if not _qualified_name(name, rel_path):
+        return False
+    own = len(PurePath(rel_path).stem)
+    return not any(
+        name in paired_test_names(other)
+        or (len(PurePath(other).stem) > own and _qualified_name(name, other))
+        for other in siblings
+        if other != rel_path
+    )

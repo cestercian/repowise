@@ -1069,7 +1069,8 @@ line up.
 | `--staged` | Diff the staged changes (`git diff --cached`); the default with no range outside CI (in CI: the pull request's change) |
 | `--format` | `table` (default), `json` (full report plus the selection), `list` (test ids one per line), or `args` (one line of runner arguments, or `:all`; reasons on stderr) |
 | `--runner` | For `--format args`: `auto` (default; `files` when mixed), `pytest` (node ids or files), `go` (package dirs), `jest` (files; pass with `--runTestsByPath`), `files` |
-| `--explain` | A test file or node id: say why it was or was not selected (the changed file, the evidence and the import route, or the rule that runs it). Added to `--format json` as `explain` |
+| `--explain` | A test file or node id: say why it was or was not selected (the changed file, the evidence and the import route, or the rule that runs it) and its place in the run order. Added to `--format json` as `explain` |
+| `--prioritize` | With `--format args`, `list` or `json`: the whole suite, the selected tests first in run order, then every other test. Skips nothing; a full run is ordered too |
 
 ```bash
 repowise impacted-tests                        # staged changes
@@ -1079,6 +1080,7 @@ repowise impacted-tests abc123                 # a single commit
 repowise impacted-tests main..HEAD --format list | xargs pytest
 repowise impacted-tests main...HEAD --format args --runner pytest
 repowise impacted-tests main...HEAD --explain tests/unit/test_api.py
+repowise impacted-tests main...HEAD --format args --prioritize
 ```
 
 `--format args` exits `0` whether it selects a subset or everything, and `2`
@@ -1091,11 +1093,24 @@ or `none` (no index), and a per-test `selected.why`: the first changed file and
 evidence that selected it, or why it runs with every subset. When it runs everything:
 [CI](../start/CI.md#selecting-the-tests-a-change-needs).
 
+**Run order.** `--format args` and `json` list the selected tests likeliest to fail
+first (`--format list` without `--prioritize` keeps the report's order). Tiers, in
+order: a test the change edits; one the per-test map runs on a changed line, then on
+a changed file; one whose calls, fixtures or direct import reach the change; one
+reaching it through other files; tests that run with every subset. Within a tier:
+a failure in the last local pytest run (`.pytest_cache`, ids relative to the
+repository root), fewer graph hops (when measured), more changes shared with the
+changed files, more changed files reached, then path. `--format json` lists each test under
+`order` with its `tier`, `hops`, `co_change` and `failed_last_run`. With
+`--prioritize`, a file selected only by some node ids runs whole at its place.
+
 ---
 
 ### `repowise health [PATH]`
 
-Compute per-file code-health scores from 51 deterministic detectors (McCabe complexity, nesting, brain methods, LCOM4 cohesion, god classes, native clone detection, untested hotspots, coverage gradient, function/ownership/churn/change-entropy organizational risk, test-quality smells, and more). Zero LLM calls by default, pure Python over tree-sitter + git data. See [`docs/layers/CODE_HEALTH.md`](../layers/CODE_HEALTH.md) for the user guide and [`docs/architecture/code-health.md`](../architecture/code-health.md) for the internals.
+Report per-file code-health scores from 51 deterministic detectors (McCabe complexity, nesting, brain methods, LCOM4 cohesion, god classes, native clone detection, untested hotspots, coverage gradient, function/ownership/churn/change-entropy organizational risk, test-quality smells, and more). Zero LLM calls by default, pure Python over tree-sitter + git data. See [`docs/layers/CODE_HEALTH.md`](../layers/CODE_HEALTH.md) for the user guide and [`docs/architecture/code-health.md`](../architecture/code-health.md) for the internals.
+
+By default it reads the analysis the last `repowise init` or `repowise update` stored, the same rows MCP and the web UI serve, and writes nothing. `--recompute` analyzes the working tree in-process instead.
 
 **Options:**
 
@@ -1106,8 +1121,9 @@ Compute per-file code-health scores from 51 deterministic detectors (McCabe comp
 | `--scope` | `all` (default) or `production`. Which files every figure describes. Tests score higher than production code, so narrowing lowers the number without a defect being found. |
 | `--counts` | `everything` (default) or `code_shape`. `code_shape` drops the git-derived half of the deduction, which rises as a file is worked on — the reading that answers whether the code itself is improving. |
 | `--refactoring-targets` | Print the refactoring queue the index stored: one opportunity per file with its structured, graph-aware plans (Extract Class / Helper / Method, Move Method, Split File) as ordered steps and Break Cycle as advisory evidence, in the same order MCP and the web UI serve. Reads the index, so it needs `repowise init` first. See [REFACTORING.md](../layers/REFACTORING.md) |
-| `--recompute` | With `--refactoring-targets`: analyze the working tree in-process instead of reading the index. Slow on a large repo; the only option outside an indexed one. `--scope` and `--counts` apply only here. |
+| `--recompute` | Analyze the working tree in-process instead of reading the stored analysis. A whole-repo `table` run writes the result back to the index (scores, findings, a trend snapshot); `json`, `md` and `--file`/`--module` runs never write. Slow on a large repo; the only option outside an indexed one. With `--refactoring-targets`, `--scope` and `--counts` apply only here. |
 | `--generate-code <selector>` | Generate an actual refactoring patch for one target. The only `health` flag that calls an LLM; needs a configured provider. |
+| `--plan <id>` | Print one stored refactoring plan as the prompt an agent applies; with `--format json`, its recipe (preconditions, steps, postconditions). Reads the index. |
 | `--trend` | Print the last 10 health snapshots + any active alerts (declining / predicted decline) |
 | `--badge` | Print a shields.io-compatible badge URL/JSON for the repo's health score |
 | `--format` | Output: `table` (default), `json`, `md` |
@@ -1124,7 +1140,7 @@ repowise health --generate-code packages/server/app.py::handler   # LLM patch fo
 repowise health --trend                               # snapshot history + alerts
 repowise health --counts code_shape                   # ignore the git-derived half
 repowise coverage add coverage.lcov   # ingest coverage, then:
-repowise health
+repowise health --recompute           # fold it into the scores now (or wait for the next update)
 repowise health --format json | jq .kpis              # machine-readable
 ```
 

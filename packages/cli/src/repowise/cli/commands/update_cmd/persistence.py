@@ -29,6 +29,7 @@ from repowise.cli.helpers import (
 )
 from repowise.core.analysis.health import HEALTH_ANALYZER_VERSION
 from repowise.core.analysis.security_scan import SECURITY_SCANNER_VERSION
+from repowise.core.ingestion.git_indexer import GIT_HISTORY_VERSION, GIT_HISTORY_VERSION_KEY
 from repowise.core.pipeline import PhaseTimings, timed
 
 from .incremental import _build_repo_graph
@@ -280,6 +281,28 @@ def heal_commit_offsets(repo_path: Any) -> None:
         run_async(_run())
 
 
+def refresh_read_snapshots(repo_path: Any) -> None:
+    """Store the Fix first queue and the next-actions view for the next reader.
+
+    A named step at every outcome of ``repowise update`` and at the end of
+    ``repowise init``, once every store is final, so ``repowise next``, the
+    overview and the dashboard read one row instead of rebuilding in each new
+    process. A view no write has invalidated since is left as it is, so the
+    "already up to date" path costs one primary-key read per view.
+    Best-effort: without a snapshot a reader builds live, as before.
+    """
+    from repowise.cli.helpers import repo_index_session
+    from repowise.core.persistence.crud.analysis.actions import write_read_snapshots
+
+    async def _run() -> None:
+        async with repo_index_session(Path(repo_path)) as opened:
+            if opened is not None:
+                await write_read_snapshots(*opened)
+
+    with contextlib.suppress(Exception):
+        run_async(_run())
+
+
 # A repair window that has grown past this many commits stopped being a repair
 # and became a re-index: the diff it forces every update to walk is no longer
 # change-sized. Bounding it is what stops a step that fails on every run from
@@ -415,6 +438,7 @@ def _persist_index_only_update(
     dependency_fingerprints: dict[str, str] | None = None,
     vector_store: Any | None = None,
     require_config_rebuild_success: bool = False,
+    history_window_changed: bool = False,
     timings: PhaseTimings | None = None,
 ) -> None:
     """Persist the index-only update (graph + symbols + git + dead-code + health + KG),
@@ -455,6 +479,7 @@ def _persist_index_only_update(
             parsed_files=parsed_files,
             git_decay_map=git_decay_map,
             full_git_summary=full_git_summary,
+            history_window_changed=history_window_changed,
             reconcile_full_scope=reconcile_full_scope,
             full_generation_page_ids=full_generation_page_ids,
             vector_store=vector_store,
@@ -535,6 +560,10 @@ def _persist_index_only_update(
             new_state["git_history_coverage"] = coverage.to_dict()
         else:
             new_state.pop("git_history_coverage", None)
+        # Every row was rewritten under the current rules, unless they never
+        # reached the store; then the next update walks again.
+        if "Git persist" not in failed_steps:
+            new_state[GIT_HISTORY_VERSION_KEY] = GIT_HISTORY_VERSION
     # Before save_state, and reading ``state`` (the pre-update dict) for the old
     # pointer: this is what keeps a degraded run recoverable now that the
     # pointer below advances to head regardless.
@@ -693,6 +722,7 @@ def _persist_full_update(
     reconcile_full_generation: bool = False,
     require_config_rebuild_success: bool = False,
     require_decision_persist_success: bool = False,
+    history_window_changed: bool = False,
     timings: PhaseTimings | None = None,
 ) -> int:
     """Persist a full (LLM-regenerating) update in one transaction.
@@ -734,6 +764,7 @@ def _persist_full_update(
             reconcile_full_generation=reconcile_full_generation,
             require_config_rebuild_success=require_config_rebuild_success,
             require_decision_persist_success=require_decision_persist_success,
+            history_window_changed=history_window_changed,
             timings=timings,
         )
     )
@@ -763,6 +794,7 @@ async def _persist_full_update_async(
     reconcile_full_generation: bool = False,
     require_config_rebuild_success: bool = False,
     require_decision_persist_success: bool = False,
+    history_window_changed: bool = False,
     timings: PhaseTimings | None = None,
 ) -> int:
     from repowise.cli.helpers import get_db_url_for_repo
@@ -1008,10 +1040,15 @@ async def _persist_full_update_async(
                             git_meta_map,
                             git_decay_map,
                             full_git_summary,
+                            # Set only on a history-window (git config) change,
+                            # the one walk that invalidates per-commit health.
+                            keep_commit_health=not history_window_changed,
                         )
                 except Exception as exc:
                     _skip("Git persist", exc)
-                    if require_config_rebuild_success:
+                    # A full walk stamps the history version once persisted,
+                    # so losing its rows here must fail the run, not stamp it.
+                    if require_config_rebuild_success or full_git_summary is not None:
                         raise
                 try:
                     with timed(timings, "persist.commits"):
@@ -1180,6 +1217,18 @@ async def _persist_full_update_async(
                 except Exception as exc:
                     _skip("Doc-drift persist", exc)
 
+            # Re-persist graph_nodes so symbol-level PageRank / betweenness /
+            # community ids reflect the current build. Before health, whose
+            # plan annotations read each symbol's ``public_api`` from here; a
+            # failed write leaves them reading the last run's flags.
+            try:
+                from repowise.core.pipeline.persist import persist_graph_nodes
+
+                with timed(timings, "persist.graph_nodes"):
+                    await persist_graph_nodes(session, repo_id, graph_builder)
+            except Exception as exc:
+                _skip("Graph nodes persist", exc)
+
             # Code-health findings + metrics (partial — upsert only).
             if partial_health_report is not None:
                 try:
@@ -1210,16 +1259,6 @@ async def _persist_full_update_async(
                         )
                 except Exception as exc:
                     _skip("Dead-code persist", exc)
-
-            # Re-persist graph_nodes so symbol-level PageRank / betweenness /
-            # community ids reflect the current build.
-            try:
-                from repowise.core.pipeline.persist import persist_graph_nodes
-
-                with timed(timings, "persist.graph_nodes"):
-                    await persist_graph_nodes(session, repo_id, graph_builder)
-            except Exception as exc:
-                _skip("Graph nodes persist", exc)
 
             # Refresh wiki_symbols for the changed files (upsert + within-file
             # prune). Without this, symbol bounds fossilize at the last full
@@ -1273,6 +1312,23 @@ async def _persist_full_update_async(
                     await refresh_external_systems(session, repo_id, repo_path, file_diffs)
             except Exception as exc:
                 _skip("External systems refresh", exc)
+
+            # Last of the store writes, for the reason the index-only path
+            # gives: the steps above upsert rows for deleted paths too.
+            from repowise.core.pipeline.incremental import prune_deleted_files
+
+            await prune_deleted_files(
+                session,
+                repo_id,
+                repo_path,
+                graph_builder,
+                {parsed.file_info.path for parsed in parsed_files or []},
+                health_report=partial_health_report,
+                skip=_skip,
+                log=console.print,
+                degraded=degraded,
+                timings=timings,
+            )
 
             # Record a GenerationJob so the web UI "last synced" timestamp updates.
             try:
@@ -1362,7 +1418,11 @@ async def _persist_full_update_async(
             if timings is not None:
                 timings.stop("persist.fts")
 
-        vector_cleanup_ids = load_cleanup_debt(Path(repo_path))["vectors"]
+        # The union closes the mark_tombstone_pages path: the scope branches
+        # above already drop their ids, but a deleted file's embedding did not.
+        vector_cleanup_ids = (
+            set(tombstoned_page_ids) | load_cleanup_debt(Path(repo_path))["vectors"]
+        )
         if vector_cleanup_ids and decision_vector_store is not None:
             try:
                 await decision_vector_store.delete_many(sorted(vector_cleanup_ids))
@@ -1520,13 +1580,21 @@ async def _rescore_health_from_db(
                 f"[yellow]{len(report.findings)} findings[/yellow]"
             )
 
+            # Graph nodes first: the plan annotations the writer below stores
+            # read each symbol's ``public_api`` from them.
+            await persist_graph_nodes(session, repo_id, graph_builder)
+
             # Same writer the index's analysis phase uses, so a re-score leaves
             # the derived queues agreeing with the findings it just replaced
             # rather than describing the set it deleted. Read HEAD off disk:
             # this pass just scored the working tree, and the stored column is
             # written by a different step whose ordering is not guaranteed.
             await save_full_health_report(
-                session, repo_id, report, analyzed_commit=get_head_commit(Path(repo_path))
+                session,
+                repo_id,
+                report,
+                analyzed_commit=get_head_commit(Path(repo_path)),
+                repo_path=repo_path,
             )
             # That writer replaced every open finding, the governance ones too,
             # and only the governance pass produces those.
@@ -1553,7 +1621,6 @@ async def _rescore_health_from_db(
                     ingested_commit_sha=live_head,
                     provenance=coverage.provenance,
                 )
-            await persist_graph_nodes(session, repo_id, graph_builder)
 
     await _rescore()
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import warnings
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -29,6 +30,7 @@ from sqlalchemy.pool import NullPool, StaticPool
 from sqlalchemy.schema import CreateIndex, CreateTable
 from sqlalchemy.sql import text
 
+from . import read_snapshots  # noqa: F401  (a write to a view's input drops the stored view)
 from .models import Base
 
 log = structlog.get_logger(__name__)
@@ -165,6 +167,7 @@ __all__ = [
     "get_session",
     "init_db",
     "resolve_db_url",
+    "schema_behind",
 ]
 
 DB_FILENAME = "wiki.db"
@@ -605,7 +608,11 @@ def _reconcile_schema(connection: object) -> None:
         # nullability. We deliberately do NOT enforce FK constraints on
         # back-filled columns: SQLite can't add an enforced FK after the
         # fact, and write-time enforcement is sufficient for our purposes.
-        db_cols = {c["name"]: c for c in inspector.get_columns(table.name)}
+        # The Alembic-only pgvector column triggers an unknown-type warning.
+        with warnings.catch_warnings():
+            if dialect.name == "postgresql":  # type: ignore[attr-defined]
+                warnings.filterwarnings("ignore", message="Did not recognize type 'vector'")
+            db_cols = {c["name"]: c for c in inspector.get_columns(table.name)}
         if dialect.name == "postgresql":  # type: ignore[attr-defined]
             for what, statement in _loosen_postgres_columns(table, db_cols, dialect):
                 _run(what, lambda statement=statement: statement)
@@ -681,3 +688,28 @@ async def init_db(engine: AsyncEngine) -> None:
             from repowise.core.persistence.search import PAGE_FTS_DDL
 
             await conn.execute(text(PAGE_FTS_DDL))
+
+
+async def schema_behind(engine: AsyncEngine) -> bool:
+    """Whether a table or column the models declare is missing from the store.
+
+    One catalogue read, so a reader can skip the reconcile ``init_db`` runs and
+    pay for it only on a store an older repowise wrote. SQLite only; another
+    backend is migrated by Alembic and reads as current.
+    """
+    if engine.dialect.name != "sqlite":
+        return False
+    async with engine.connect() as conn:
+        rows = await conn.execute(
+            text(
+                "SELECT m.name, p.name FROM sqlite_master AS m "
+                "JOIN pragma_table_info(m.name) AS p WHERE m.type = 'table'"
+            )
+        )
+        live: dict[str, set[str]] = {}
+        for table, column in rows:
+            live.setdefault(table, set()).add(column)
+    return any(
+        not {c.name for c in table.columns} <= live.get(name, set())
+        for name, table in Base.metadata.tables.items()
+    )

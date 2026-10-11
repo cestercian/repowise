@@ -17,8 +17,9 @@
  * symbol-drawer deep links point at it) but is labelled for what it is.
  *
  * Tabs carry their count where one is cheap to get, so a clean repo says so
- * before you spend a click. Findings rides on the overview request the page
- * already makes and dead code dedupes onto the key its own tab uses. Security
+ * before you spend a click. Dead code dedupes onto the key its own tab uses.
+ * Findings is not numbered: the overview's queue inventory is not the list the
+ * tab opens on, and that list's own total is a multi-second query. Security
  * has no count endpoint (only a findings list), and blast radius is a tool you
  * operate rather than a pile you read, so neither is numbered.
  */
@@ -239,6 +240,7 @@ const CHURN_POINT_LIMIT = 5000;
 
 export default function CodeHealthPage() {
   const t = useTranslations("views.codeHealth");
+  const tc = useTranslations("common");
   const params = useParams<{ id: string }>();
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -290,8 +292,7 @@ export default function CodeHealthPage() {
   const selectedPath = searchParams.get("file");
   const opportunityId = searchParams.get("opportunity");
 
-  // Shares the SWR key with TriageView — the meta line and the findings count
-  // cost no extra request.
+  // Shares the SWR key with TriageView, so the meta line costs no extra request.
   const { data: overview } = useSWR<HealthOverviewResponse>(
     `code-health-overview:${repoId}${viewKey}`,
     () => getHealthOverview(repoId, 25, scope, counts),
@@ -319,6 +320,7 @@ export default function CodeHealthPage() {
     data: trend,
     isLoading: trendLoading,
     error: trendError,
+    mutate: mutateTrend,
   } = useSWR<HealthTrendResponse>(
     `code-health-trend:${repoId}${scopeKey}`,
     () => getHealthTrend(repoId, 20, scope),
@@ -425,12 +427,6 @@ export default function CodeHealthPage() {
   );
 
   const badges: Partial<Record<TabId, number | string>> = {};
-  // Performance has its own tab and is out of the findings list, so counting
-  // it here would put a bigger number on the tab than the tab can show.
-  if (overview) {
-    badges.findings =
-      overview.summary.open_findings - (overview.summary.performance_findings ?? 0);
-  }
   if (deadCode) badges["dead-code"] = deadCode.total_findings;
   // No badge when the drift pass has not run: the response carries a cause
   // rather than a summary, and a 0 there would read as clean documentation.
@@ -497,7 +493,7 @@ export default function CodeHealthPage() {
   return (
     <PageShell
       title={t("title")}
-      icon={<HeartPulse className="h-5 w-5 text-[var(--color-success)]" />}
+      icon={<HeartPulse />}
       // No description: the lede below opens with what the score is built from,
       // and a header that says it first only says it twice.
       //
@@ -544,11 +540,15 @@ export default function CodeHealthPage() {
     >
       {/* Replaced each release that moves health scores, and keyed with that
           release's version so a reader who dismissed an earlier one sees it. */}
-      <ReleaseNotice id="health-scoring" version="0.55.0">
-        <span className="font-medium text-[var(--color-text-primary)]">
-          {t("coChangeNoticeTitle")}
-        </span>{" "}
-        {t("coChangeNoticeBody")}
+      <ReleaseNotice
+        id="health-scoring"
+        version="0.55.0"
+        detail={t("coChangeNoticeBody")}
+        detailLabel={t("coChangeNoticeMore")}
+        hideLabel={t("coChangeNoticeLess")}
+        dismissLabel={tc("dismiss")}
+      >
+        {t("coChangeNoticeTitle")}
       </ReleaseNotice>
 
       {meta ? (
@@ -598,6 +598,7 @@ export default function CodeHealthPage() {
                   data={trend}
                   isLoading={trendLoading}
                   error={trendError}
+                  onRetry={() => void mutateTrend()}
                   counts={counts}
                 />
               </OverviewSection>

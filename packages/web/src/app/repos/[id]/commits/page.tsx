@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { GitCommitHorizontal } from "lucide-react";
 import { PageShell } from "@repowise-dev/ui/shared/page-shell";
+import { EmptyState } from "@repowise-dev/ui/shared/empty-state";
 import { OverviewSection, SectionLink } from "@repowise-dev/ui/overview";
 import { CommitsLede } from "@repowise-dev/ui/commits/commits-lede";
 import { CodeEvolutionChart } from "@repowise-dev/ui/commits/code-evolution-chart";
@@ -73,20 +74,22 @@ export default async function CommitsPage({
   if (!firstPage || total === 0) {
     return (
       <PageShell
-        icon={<GitCommitHorizontal className="h-5 w-5 text-[var(--color-accent-primary)]" />}
+        icon={<GitCommitHorizontal />}
         title={t("title")}
         description={t("emptyDescription")}
       >
-        <p className="max-w-[62ch] text-sm text-[var(--color-text-secondary)]">
-          {t("emptyHint")}
-        </p>
+        <EmptyState
+          title={t("emptyTitle")}
+          description={t("emptyHint")}
+          action={{ label: t("emptyAction"), href: `${base}/overview` }}
+        />
       </PageShell>
     );
   }
 
   return (
     <PageShell
-      icon={<GitCommitHorizontal className="h-5 w-5 text-[var(--color-accent-primary)]" />}
+      icon={<GitCommitHorizontal />}
       title={t("title")}
       description={t("description")}
     >

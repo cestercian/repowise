@@ -243,7 +243,7 @@ What history says about touching a file: hotspot score, bug-fix record, owners, 
 | `include` | list[string] | none | `graph` (typed dependents, consumers, cross-repo links), `churn`, `owners` (owner percentages, bus factor, contributor count), `tests` (typed `test_recommendations` in PR mode), `blast` (`pr_blast_radius` in PR mode), `scales` (units and calibration, identical per call) |
 | `repo` | string | default repo | Workspace repo alias. `"all"` is not supported |
 
-**Key return fields:** per file: `hotspot_score` (0 to 1), `health_score` (0 to 10), `dependents_count`, `co_change_partners` (`file_path`, `support`, `conf_ab`, `has_import_link`), `primary_owner` (detailed owner metrics are opt-in under `include=["owners"]`), test gaps, `security_signals`. In PR mode, `directive` with `may_break`, `missing_cochanges`, `tests_to_run`, `tests_to_run_basis` (`measured`, `inferred` or `none`), `tests_to_update` (test files to edit, each with a `name_pair`, `imports` or `co_change` reason), `coverage`, `recommended_reviewers`, `next_calls`, and `reach` (`localized`, `moderate` or `broad`; `null` when no structural score was computed). `include=["blast"]` adds `pr_blast_radius`; the raw 0 to 10 `structural_impact_score` and its scale appear there only with `include=["blast", "scales"]`. `missing_tests` appears only when coverage can back it. A target naming no indexed file returns `resolved: false` with a reason, never zeroed counts.
+**Key return fields:** per file: `hotspot_score` (0 to 1), `health_score` (0 to 10), `dependents_count`, `co_change_partners` (`file_path`, `support`, `conf_ab`, `has_import_link`), `primary_owner` (detailed owner metrics are opt-in under `include=["owners"]`), test gaps, `security_signals`. In PR mode, `directive` with `may_break`, `missing_cochanges`, `tests_to_run` (the same selection `repowise impacted-tests` makes), `tests_to_run_basis` (`measured`, `inferred` or `none`), `tests_run_all` (with `tests_run_all_reasons` when every test must run), `tests_to_update` (test files to edit, each with a `name_pair`, `imports` or `co_change` reason), `coverage`, `recommended_reviewers`, `next_calls`, and `reach` (`localized`, `moderate` or `broad`; `null` when no structural score was computed). `include=["blast"]` adds `pr_blast_radius`; the raw 0 to 10 `structural_impact_score` and its scale appear there only with `include=["blast", "scales"]`. `missing_tests` appears only when coverage can back it. A target naming no indexed file returns `resolved: false` with a reason, never zeroed counts.
 
 Dependent counts are a floor over the indexed graph, and structural reach is not proof of runtime breakage. `reach` bands an uncalibrated heuristic that never sees the diff; it is not a probability.
 
@@ -322,32 +322,34 @@ Code-health scores and findings from the stored analysis, across defect risk, ma
 | Parameter | Type | Default | Meaning |
 |-----------|------|---------|---------|
 | `targets` | list[string] | none (dashboard) | File paths or `module:<name>`. Misses are named in `unresolved` |
-| `include` | list[string] | none | Blocks: `biomarkers`, `refactoring`, `trend`, `coverage`, `accuracy`, `signals`, `churn_complexity`, `doc_drift`, `semantics`, `unverified`. Dimension filters: `performance`, `defect`, `maintainability`, `advisory` |
-| `only` | list[string] | none | Keep just these top-level keys; identity, totals and recovery fields always survive |
-| `limit` | int | `20` | Max rows in every ranked list, capped at 50; `0` for none |
-| `cursor` | int | `0` | Offset into a ranked list; the `recovery` block names the next call |
+| `include` | list[string] | none | Blocks: `biomarkers`, `refactoring`, `trend`, `coverage`, `accuracy`, `signals`, `churn_complexity`, `doc_drift`, `semantics`, `unverified`, `recipe` (with `plan_id`). Dimension filters: `performance`, `defect`, `maintainability`, `advisory` |
+| `only` | list[string] | none | Keep just these top-level keys; identity, totals and recovery fields always survive. An unknown key is named in `unknown_only_keys` with `unknown_only_keys_hint` |
+| `limit` | int | `20` | Max rows in every ranked list, capped at 50; `0` for none. `fix_first` shows five unless `limit` is passed with `only=["fix_first"]`, which pages up to 25; `refactoring_plans` up to 25 |
+| `cursor` | int | `0` | Offset into a ranked list (and into `fix_first` when named in `only`); the `recovery` block names the next call |
 | `fix_id` | string | none | Open one `fix_first` item in full |
-| `finding_id`, `plan_id` | string | none | Open one finding or refactoring plan by id |
+| `finding_id`, `plan_id` | string | none | Open one finding or refactoring plan by id. With `plan_id`, `include=["recipe"]` adds `plan.recipe`: the plan's preconditions, ordered steps, postconditions and what it must not do |
 | `opportunity_id` | string | none | Open one opportunity: `perf...` for performance, `refop...` for a refactoring |
 | `refactoring_view` | string | `"diversified"` | `diversified`, `canonical` or `file_spread` |
-| `refactoring_scope` | string | `fix_first` without targets, `all` with | Which open refactoring opportunities to list |
+| `refactoring_scope` | string | `fix_first` without targets, `all` with | Which open refactoring opportunities, and their plans, to list |
 | `refactoring_type`, `refactoring_confidence`, `refactoring_effort` | string | none | Refactoring queue filters |
 | `performance_view` | string | `detail` | `detail` or `summary` |
 | `performance_context` | string | `production` | `production`, `tooling`, `test`, `unknown` or `all` |
-| `performance_boundary`, `performance_confidence`, `performance_actionability`, `performance_sort` | string | none | Performance queue filters |
+| `performance_boundary`, `performance_confidence`, `performance_actionability`, `performance_sort` | string | none | Performance queue filters. The queue lists causes whose cost is measured; unproven ones (loop size unknown) are counted in the `proof` facet and `default_queue.excluded.unmeasured_cost` |
 | `scope` | string | `"all"` | `production` drops test files from every figure |
 | `counts` | string | `"everything"` | `code_shape` drops the git-derived half of the score |
 | `repo` | string | default repo | Workspace repo alias. `"all"` is not supported |
 
 Only one of `fix_id`, `finding_id`, `plan_id`, `opportunity_id` per call; passing two returns `mode: "conflict"`.
 
-**Key return fields:** `mode`, `fix_first` (`lead`, up to five `items` each with a `next_call`, `totals`), `kpis`, `gap_analysis`, `worst_files`, `high_leverage_files` (ranked by `weighted_deficit`), `top_findings`, `unresolved`, and the opt-in blocks you named. `_meta.health_analysis` says whether stored analysis exists and which commit it describes.
+**Key return fields:** `mode`, `fix_first` (`lead` with its `next_call`, up to five `items`, `counts`, `totals`; a due lead carries its `first_step` and `verify` command, so it can be started without a `fix_id` call; `only=["fix_first"]` adds them to the other due items on the page), `kpis`, `gap_analysis`, `worst_files`, `high_leverage_files` (ranked by `weighted_deficit`), `top_findings`, `unresolved`, and the opt-in blocks you named. `_meta.health_analysis` says whether stored analysis exists and which commit it describes.
 
 The response is bounded. Pair `include` with `only` to keep one block, e.g. `get_health(include=["refactoring"], only=["refactoring_opportunities"])`.
 
 ```
-get_health(only=["fix_first"])
+get_health(only=["fix_first"], limit=25)
+get_health(only=["fix_first"], limit=25, cursor=25)
 get_health(fix_id="fix1_...")
+get_health(include=["refactoring"], only=["refactoring_plans"], limit=15, refactoring_scope="all")
 get_health(targets=["src/api/server.py"], include=["signals"])
 get_health(include=["performance"], only=["performance_summary"])
 get_health(include=["coverage"], only=["coverage"])
@@ -435,7 +437,7 @@ get_execution_flows(entry_point="src/cli/main.py::main", max_depth=4)
 
 Turns one refactoring plan from `get_health(include=["refactoring"])` into generated code and a unified diff, grounded on the plan and the source spans it names. Extract Class results include an LCOM4 before-and-after check. It calls the repo's configured LLM provider, and caches by content hash so an unchanged plan never regenerates.
 
-Adding the tool to the surface is the opt-in step. Generation then runs unless `.repowise/config.yaml` sets `refactoring.llm.enabled: false`, in which case the plan is returned with `generation.available: false` and `reason: "disabled"`. With no provider configured it returns `error: "no_provider"`.
+Adding the tool to the surface is the opt-in step. Generation then runs only when `.repowise/config.yaml` sets `refactoring.llm.enabled: true` (off by default); otherwise the plan is returned with `generation.available: false` and `reason: "disabled"`. With no provider configured it returns `error: "no_provider"`.
 
 | Parameter | Type | Default | Meaning |
 |-----------|------|---------|---------|

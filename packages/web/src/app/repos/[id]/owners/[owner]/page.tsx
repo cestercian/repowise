@@ -8,6 +8,7 @@ import { OwnerProfileView } from "@repowise-dev/ui/owners/owner-profile";
 import { EmptyState } from "@repowise-dev/ui/shared/empty-state";
 import { fileEntityPath } from "@repowise-dev/ui/shared/entity";
 import { formatDate, formatRelativeTimeOrNull } from "@repowise-dev/ui/lib/format";
+import { ApiClientError } from "@/lib/api/client";
 import { getOwnerProfile } from "@/lib/api/owners";
 
 export async function generateMetadata(): Promise<Metadata> {
@@ -34,18 +35,23 @@ export default async function OwnerProfilePage({
   const base = `/repos/${id}`;
   const ownerKey = decodeURIComponent(owner);
 
-  const profile = await getOwnerProfile(id, ownerKey).catch(() => null);
+  // Only a 404 means "no such contributor"; anything else is a failed
+  // request and goes to the route error boundary.
+  const profile = await getOwnerProfile(id, ownerKey).catch((e: unknown) => {
+    if (e instanceof ApiClientError && e.status === 404) return null;
+    throw e;
+  });
 
   if (!profile) {
     return (
       <PageShell
-        icon={<Users className="h-5 w-5 text-[var(--color-accent-primary)]" />}
+        icon={<Users />}
         title={t("profileTitle")}
       >
         <EmptyState
-          icon={<Users className="h-6 w-6" />}
           title={t("profileEmptyTitle")}
           description={t("profileEmptyDescription")}
+          action={{ label: t("profileBack"), href: `${base}/owners` }}
         />
       </PageShell>
     );

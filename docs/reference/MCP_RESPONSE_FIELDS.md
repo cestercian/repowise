@@ -107,7 +107,7 @@ The key is absent when every argument was understood. One entry per argument.
 
 ## Next-call shape
 
-Every suggested follow-up (`get_health`'s `fix_first[].next_call`, the refactoring and performance summaries' `next_call`, `get_risk`'s `directive.next_calls`) has one shape:
+Every suggested follow-up (`get_health`'s `fix_first.lead.next_call`, the refactoring and performance summaries' `next_call`, `get_risk`'s `directive.next_calls`) has one shape:
 
 | Field | Meaning |
 |-------|---------|
@@ -223,8 +223,8 @@ Opt-in blocks: `owners` adds `owner_pct`, `owner_line_pct`, `recent_owner`, `rec
 |-------|---------|
 | `may_break` | Production files in reverse-import reach of the change: candidates for review, not proven breakage |
 | `missing_cochanges` | Historical co-change partners absent from the change |
-| `tests_to_run`, `tests_to_run_basis` | The test ids or files to run, and whether the list is `measured`, `inferred` or `none`. When coverage exists the list is the measured one; test files in reverse-import reach that it lacks come back as `inferred` rows with `reason: structural_reach` under `include=["tests"]`. An unmeasured list takes those files directly, and a `none` list that gains any becomes `inferred`. An empty list with unavailable coverage never means no tests are needed |
-| `tests_to_update` | Up to three test files the change will probably need edited, each `{path, reason}` with `reason` `name_pair` (named for a changed file), `imports` (imports one directly) or `co_change` (changes with one in git history), in that order. Tests to edit, not to run: a file can appear in both lists. Empty when none qualify |
+| `tests_to_run`, `tests_to_run_basis` | The tests the change needs, from the same selection `repowise impacted-tests` makes, capped at ten, in `repowise impacted-tests`' [run order](CLI_REFERENCE.md#repowise-impacted-tests-revspec). `tests_to_run_basis` is `measured` when coverage decided a changed file, `inferred` when only the graph or a rule did, `none` when nothing named a test. `tests_to_run_why` gives the reason for each listed file (the changed file and evidence, or `runs with every subset: ...`). `tests_run_all` true means no subset can be vouched for and `tests_run_all_reasons` says why; the list is then what to run first. A failed selection carries `tests_status` and `tests_status_reason` and names nothing |
+| `tests_to_update` | Up to three test files the change will probably need edited, each `{path, reason}` with `reason` `name_pair` (named for a changed file), `imports` (its own code imports one; a conftest or setup file reaching it does not count) or `co_change` (changes with one in git history), in that order. Only tests the selection runs because of a changed file and that a runner collects. Tests to edit, not to run: a file can appear in both lists. Empty when none qualify |
 | `missing_tests`, `files_without_measured_tests` | Changed files with no measured test. `missing_tests` is absent when coverage is unavailable or stale, since an empty list would read as no gaps |
 | `coverage` | `{status, reason}` when there is no per-test coverage map. With a map, `coverage_analysis`, `test_analysis` and `test_inference_analysis` say whether each evidence source was available, stale, partial or degraded |
 | `test_recommendations` | With `include=["tests"]`: typed rows, each with a `basis`: `measured` (the per-test coverage map found the test) or `inferred` (structural reach, not coverage proof) |
@@ -250,7 +250,7 @@ Every float is rounded to 4 significant digits. Direct rows' `structural_score` 
 | `diff_shape` | One sentence on size and spread; never a danger verdict |
 | `working_tree` | Present only when `revspec` was omitted: whether uncommitted work was scored, or a clean tree fell back to `HEAD` |
 | `fix_history` | Recency-weighted bug-fix record of the touched files, with `percentile` and `overlap`; the raw `density` ships with `include=["diagnostics"]` |
-| `impacted_tests` | Tests that execute the changed lines |
+| `impacted_tests` | The tests the change needs, and whether every test must run |
 | `patch_coverage` | Share of changed executable lines the stored coverage ran |
 | `branch_overlap` | Other branches editing the same files |
 | `independent_changes` | When the diff is several unrelated changes |
@@ -260,7 +260,7 @@ Every float is rounded to 4 significant digits. Direct rows' `structural_score` 
 
 **health_delta.** Both revisions are analysed from their own content, and a finding at head is reported only when the diff explains it. `scope` counts changed, eligible, analysed, skipped and failed files; `status` is `available`, `partial` or `unavailable`, and `partial` is never a clean bill. Documentation and configuration files (Markdown, JSON, YAML, TOML and the other doc or config extensions) are skipped with reason `not_code` and never make a run `partial`; a change made only of them reads `clear_in_analyzed_scope` with a headline saying health analysis does not cover them. HTML, schema and other files with no health dialect still make a run `partial`. `introduced`, `worsened` and `resolved` are totals; `top_findings` holds the three most actionable, with `findings_total`. Each finding names `dimension`, `biomarker`, `severity`, `path`, `symbol`, head-side `lines`, a `reason`, and an `attribution` (`basis` of `added_lines`, `changed_symbol`, `changed_call_edge`, `new_file`, `file_change`, `context_change` or `unknown`, with a `confidence`). Identity ignores line numbers, so moved code introduces nothing. `inspect` gives the `finding_id` call that expands one; ids are bound to the two revisions. A finding that matches a stored one carries `health_reference` for `get_health(finding_id=...)`. Performance findings carry `opportunity_id` and are ordered by opportunity rank.
 
-**impacted_tests.** `tests_to_run` names tests the per-test coverage map proves execute the changed lines, capped at ten with `total` and `truncated`. With a coverage map, `map_present` is true and `line_coverage` buckets: `untested_changes`, `stale_test_candidates` (covered lines whose test file is absent from the diff), `covered`, `no_coverage_data`. With no coverage map, `map_present`, `line_coverage` and (unless tests are named) `tests_to_run_kind` are absent, and `status` is `inferred` when the import graph names test files reaching the change, or `no_map` (run the full suite). `basis` is always present: `measured`, `inferred` or `none`; `tests_to_run_kind` is `test_id` or `test_file` whenever `tests_to_run` is filled. Build the measured map with `coverage run --contexts=test` and `repowise coverage add`.
+**impacted_tests.** The same selection `repowise impacted-tests` makes over the whole change (every touched path, whatever the score's filters). `status` is `selected` or `run_all` (or `no_index`, `unknown`, `config_invalid`, `timeout`, `busy`, `no_source_line_changes` when nothing was selected, each with `run_all` true; `timeout` means the selection took over 30 seconds and `busy` that one for this repository is still running, and `repowise impacted-tests` gives the answer); `run_all` true means no subset can be vouched for, with up to three `reasons` (`reasons_total` counts them all). `tests_to_run` (capped at ten, `total` and `truncated`) is in `repowise impacted-tests`' [run order](CLI_REFERENCE.md#repowise-impacted-tests-revspec), the `always_run_total` tests that run with every subset last; `why` gives each listed file's reason. With `run_all` the list is what to run first. `tests_to_run_kind` is `test_id` when a coverage node id is listed, else `test_file`. `basis` is `measured` when coverage decided a changed file, `inferred` when only the graph or a rule did, `none` when nothing named a test; `basis_by_file` names the evidence per changed file (`coverage`, `changed-test`, `call-graph`, `import-graph`, `conftest`, `full-run`, `no-tests-needed`, ...). With a coverage map, `map_present` is true and `line_coverage` buckets the scored files' changed lines, matched on the side of the diff the map was measured at (by file when it was measured at neither): `untested_changes`, `stale_test_candidates` (covered lines whose test file is absent from the diff), `covered`, `no_coverage_data`. Build the measured map with `coverage run --contexts=test` and `repowise coverage add`.
 
 **patch_coverage.** Present when the index stores coverage; the same computation and JSON shape `repowise coverage check --format json` gates on. `patch_coverage_pct` is null when no changed line is executable; files the report never names read `not_in_report`. `scope.freshness` is `stale` when coverage was measured at another commit than the change's head. `path_gates` judges the path-scoped gates in `coverage.gates`. Each file row carries `risk` (`fix_pressure`, `dependents`, `hotspot`, `bug_magnet`, `risky`, `reasons`, `basis`) and up to eight `hints` per uncovered range: `range`, `symbol`, up to three `tests` to extend, and a `basis` of `per_test` (measured), `call_graph` or `import_graph` (inferred). Without a `revspec`, it covers everything a push would bring, diffed from the merge-base with the default base branch.
 
@@ -325,14 +325,18 @@ One ranked queue across refactoring, performance and code-shape work, the same o
 
 | Field | Meaning |
 |-------|---------|
-| `lead` | Equal to `items[0]` |
-| `items` | Up to five: `id`, `tier`, `kind`, `title`, `target`, `why`, `gain`, `effort`, `confidence`, `next_call` |
+| `lead` | The queue's first item, whatever page `items` is, with its `next_call` |
+| `items` | Up to five. With `only=["fix_first"]` the list pages from `cursor` and `recovery.fix_first` names the next page; a passed `limit` sets the page size, up to 25. Each: `id`, `tier`, `kind`, `title`, `target`, `why`, `gain`, `effort`, `confidence`; a `now` or `next` `lead` also carries `first_step` (`action`, `line`, and `file` when it is not the target's) and `verify` (`command`, or `prerequisite` when no test reaches it); with `only=["fix_first"]` the other due items among a page's first five carry them too. `get_health(fix_id=...)` returns one in full, with its `next_call` |
+| `items_total`, `cursor` | The eligible items `items` was cut from, and where the page starts |
+| `counts` | `inventory` (every unit considered), `in_scope` (less units excluded for where the code lives: `test`, `tooling`, `generated`, `vendored`, `docs_example`), `eligible` (became an item), `due` (eligible items in tier `now` or `next`), `shown` (items in this response), `excluded` (every non-zero exclusion, by reason) |
 | `tier` | `now` (worth doing, safe to start), `next` (worth doing, needs judgment), `later` |
 | `kind` | `refactor` (one file's composed refactoring), `perf_fix` (one intervention with its sinks), `finding` (a code-shape finding with no plan) |
-| `totals` | `candidates`, `eligible`, `shown`, `excluded` counted by reason (`gated_off`: a constant flag in the same file switches the function off; `unreachable`: sure dead code, delete it), and `dormant`: distinct functions kept out as `gated_off` |
-| `by_improves`, `basis`, `model_version`, `detail_call` | Rollup, basis, and the call that opens the lead in full |
+| `totals` | `candidates`, `eligible`, `shown`, and `dormant`: distinct functions kept out as `gated_off`. The exclusions by reason are in `counts.excluded` (`gated_off`: a constant flag in the same file switches the function off; `unreachable`: sure dead code, delete it) |
+| `by_improves`, `detail_call` | Rollup, and the call that opens the lead in full; the analysed commit and time are in `_meta.health_analysis` |
 
-Items are ordered by value first, then tier. History markers (churn, ownership, co-change, prior fixes) never create or lead an item; they ride on an item under `context`, and history-only files count under `totals.excluded.history_only`. `fix_first` always describes production code, whatever `scope` says; `limit` caps the items, never which leads.
+Findings, performance causes and refactoring plans carry the same count object when their list is named in `only`: `top_findings_counts`, `performance_opportunities_counts`, `refactoring_plans_counts`. The CLI and dashboard report the same numbers.
+
+Items are ordered by value first, then tier. History markers (churn, ownership, co-change, prior fixes) never create or lead an item; they ride on an item under `context`, and history-only files count under `counts.excluded.history_only`. `fix_first` always describes production code, whatever `scope` says; `limit` caps the items, never which leads.
 
 ### Dashboard and metric rows
 
@@ -365,7 +369,7 @@ Provisional finding types appear only with `include=["unverified"]`, each marked
 | `semantics` | `_meta.health_semantics`: the legend for deficit points and percentiles |
 | `performance`, `defect`, `maintainability`, `advisory` | Filter findings to one dimension; `performance` also adds the performance queue |
 
-`only` aliases: `biomarkers` -> `findings`, `accuracy` -> `defect_accuracy`, `refactoring` -> `refactoring_plans`. Dimension names have no single key and land in `unknown_only_keys`; for `signals` in targeted mode, name `metrics`.
+`only` aliases: `biomarkers` -> `findings`, `accuracy` -> `defect_accuracy`, `refactoring` -> `refactoring_plans`. Dimension names have no single key and land in `unknown_only_keys`, beside `unknown_only_keys_hint`; for `signals` in targeted mode, name `metrics`.
 
 ### Refactoring
 
@@ -373,13 +377,15 @@ Provisional finding types appear only with `include=["unverified"]`, each marked
 
 `get_health(opportunity_id="refop...")` returns full steps, member plans, the validation profile and `next_actions`; `only=["refactoring_evidence"]` with `cursor` pages the evidence. `found` says whether the id matched; `status` is `open`, `acknowledged`, `resolved` or `false_positive`. `refactoring_summary` rolls up by type, effort, confidence and lifecycle.
 
-`refactoring_plans` is the raw per-detector list, returned only when named in `only`: `extract_class` (cohesion `groups`), `extract_helper` (clone `occurrences`, `suggested_site`), `move_method`, `break_cycle` (`cut_edges`). Each carries `evidence`, `impact_delta`, `effort_bucket`, `blast_radius`, `file_weighted_deficit` and an `id` for `generate_refactoring_code`. An empty requested list has `refactoring_plans_status.reason`: `no_applicable_findings`, `plan_analysis_indeterminate`, `no_eligible_targets` or `analysis_unavailable`. See [REFACTORING.md](../layers/REFACTORING.md).
+`refactoring_plans`, returned only when named in `only`, lists the plans of the refactoring queue in queue order: each opportunity's steps together, in step order, under the same `refactoring_scope`, filters and view as `refactoring_opportunities`, up to 25 per page. A row is compact: `id` (for `plan_id` and `generate_refactoring_code`), `refactoring_type`, `file_path`, `target_symbol`, `line_start`, `line_end`, `effort_bucket`, `confidence`, `impact_delta`, `source_biomarker`, `opportunity_id`, `classification` (`mechanical` or `judgment`), `relocated_by` when set, and on a Split File plan `relocates`, the ids of the plans it relocates, which it stands for instead of listing them; `get_health(plan_id=...)` returns the plan in full (detector detail such as cohesion `groups` or `cut_edges`, `evidence`, `blast_radius`, validation), and for a plan the index resolved, its `payoff`. `refactoring_plans_total` and the page cursor count plans in scope, so a page that holds a Split File row can list fewer rows than the plans it covers, `refactoring_plans_opportunities_total` the opportunities they are steps of, `refactoring_plans_scope` names the scope and `refactoring_plans_hidden` counts what the `fix_first` scope leaves out, by reason. Performance plans are listed by `performance_opportunities`. An empty requested list has `refactoring_plans_status.reason`: `no_applicable_findings`, `plan_analysis_indeterminate`, `no_eligible_targets` or `analysis_unavailable`. See [REFACTORING.md](../layers/REFACTORING.md).
 
 ### Performance
 
 Performance findings carry `health_impact: 0`; the pillar never blends into the score. They rank on an integer `perf_rank`, which weighs the marker (superlinear above per-iteration crossings above in-loop CPU), the boundary crossed (`details.boundary_kind`: subprocess, then network or database, then lock, then filesystem) and whether the loop crosses a function call (`details.cross_function`). It is an ordering key, not a score.
 
 A bare `get_health()` ranks performance work inside `fix_first` as `perf_fix` items. `get_health(opportunity_id="perf...")` adds `plan_steps`, `validation` and `siblings`; `only=["performance_evidence"]` with `cursor` pages the evidence. Ids are stable within a performance model version; an id from an older model resolves to `model_state.state: "stale_model"` with `refresh_required`. `lifecycle_status` is `open` or `resolved`. Evidence rows carry a public `finding_id`.
+
+The `performance_opportunities` list holds causes whose cost is measured (`cost_proof` `proven`). A cause whose loop size nothing measured is `unproven`: it never sets `may_lead`, and every list leaves it out. `performance_summary.default_queue.excluded.unmeasured_cost` counts the ones the default queue drops, `performance_summary.proof` counts both values, and the `proof` facet counts them under the current filters. REST lists them with `proof=unproven` on `/api/repos/{id}/health/performance-opportunities`.
 
 ### Coverage
 

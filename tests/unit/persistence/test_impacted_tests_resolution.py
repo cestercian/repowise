@@ -1,6 +1,6 @@
 """The ``impacted-tests`` resolution path: changed lines -> impacted tests.
 
-Exercises :func:`_resolve_impacted` against a seeded ``test_coverage`` table so
+Exercises :func:`resolve_impacted` against a seeded ``test_coverage`` table so
 the honest outcomes are pinned and stay distinguishable: a coverage-backed hit,
 an inferred candidate when a changed file has no coverage rows (the import graph
 first, a filename-pattern guess second), and "unknown" when nothing knows of a
@@ -9,8 +9,9 @@ test. The diff parser and CRUD line-intersection are tested separately.
 
 from __future__ import annotations
 
-from repowise.cli.commands.impacted_tests_cmd import _empty_result, _resolve_impacted
 from repowise.core.analysis.health.coverage import TestCoverage
+from repowise.core.analysis.test_collection import empty_result as _empty_result
+from repowise.core.analysis.test_collection import resolve_impacted as _resolve_impacted
 from repowise.core.persistence.crud import save_test_coverage
 from tests.unit.persistence.helpers import insert_repo
 
@@ -166,6 +167,7 @@ async def test_a_changed_test_file_is_its_own_candidate(async_session) -> None:
         }
     ]
     assert out["unknown"] == []
+    assert out["test_hops"] == {"tests/test_bar.py": 0}
 
 
 async def _graph(session, repo_id, tests: set[str], files: set[str], imports: list[tuple]):
@@ -219,6 +221,12 @@ async def test_the_import_graph_reaches_tests_through_modules_and_other_tests(
         "tests/test_child.py": "import-graph",
     }
     assert out["unknown"] == []
+    # Fewest dependency hops from the change, for ordering; 1 is a direct import.
+    assert out["test_hops"] == {
+        "tests/base.py": 1,
+        "tests/test_api.py": 2,
+        "tests/test_child.py": 2,
+    }
 
 
 async def test_graph_candidates_are_not_capped(async_session) -> None:
@@ -276,12 +284,12 @@ async def test_coverage_adds_to_the_graph_and_never_replaces_it(async_session) -
 
 
 async def test_a_graph_read_failure_is_reported_not_swallowed(async_session, monkeypatch) -> None:
-    from repowise.cli.commands import impacted_tests_cmd
+    from repowise.core.analysis import test_collection
 
     async def _broken(*_a, **_k):
         raise RuntimeError("edge table locked")
 
-    monkeypatch.setattr(impacted_tests_cmd, "_graph_candidates", _broken)
+    monkeypatch.setattr(test_collection, "_graph_candidates", _broken)
     repo = await insert_repo(async_session)
     out = _empty_result(1)
     await _resolve_impacted(async_session, repo.id, {"src/a.py": {1}}, set(), out)
@@ -527,3 +535,100 @@ async def test_a_reaching_fixture_nobody_requests_selects_only_the_import_check(
     out = await _narrowed(async_session, repo.id)
 
     assert _pairs(out, "src/app/util.py") == {"tests/test_a.py": "conftest-import-check"}
+
+
+async def test_narrow_scopes_resolves_a_reached_conftest_as_the_selection_does(
+    async_session, tmp_path
+) -> None:
+    """A few-hop walk that stopped at the conftest gets the test that can break."""
+    import subprocess
+
+    from repowise.core.analysis.test_collection import narrow_scopes
+
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests/conftest.py").write_text(_CONFTEST, encoding="utf-8")
+    # The conftests come from the checkout's tracked files.
+    for args in (["init", "-q"], ["add", "tests/conftest.py"]):
+        subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
+    repo = await insert_repo(async_session, local_path=str(tmp_path))
+    await _conftest_graph(async_session, repo.id, stamped=True)
+    test_files = {"tests/conftest.py", "tests/test_a.py", "tests/test_b.py", "tests/test_c.py"}
+
+    out = await narrow_scopes(
+        async_session,
+        repo.id,
+        {"src/app/util.py": ["tests/conftest.py"], "src/other.py": ["tests/test_c.py"]},
+        test_files,
+    )
+
+    assert out == {"src/app/util.py": ["tests/test_a.py"], "src/other.py": ["tests/test_c.py"]}
+
+
+async def test_narrow_scopes_keeps_every_test_under_a_conftest_it_cannot_read(
+    async_session, tmp_path
+) -> None:
+    from repowise.core.analysis.test_collection import narrow_scopes
+
+    repo = await insert_repo(async_session, local_path=str(tmp_path))
+    await _conftest_graph(async_session, repo.id, stamped=True)
+    test_files = {"tests/conftest.py", "tests/test_a.py", "tests/test_b.py", "tests/test_c.py"}
+
+    out = await narrow_scopes(
+        async_session, repo.id, {"src/app/util.py": ["tests/conftest.py"]}, test_files
+    )
+
+    assert out == {"src/app/util.py": ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]}
+
+
+async def test_narrow_scopes_keeps_the_whole_scope_for_a_target_the_walk_does_not_answer(
+    async_session, tmp_path
+) -> None:
+    from repowise.core.analysis.test_collection import narrow_scopes
+
+    repo = await insert_repo(async_session, local_path=str(tmp_path))
+    await _conftest_graph(async_session, repo.id, stamped=True)
+    test_files = {"tests/conftest.py", "tests/test_a.py", "tests/test_b.py", "tests/test_c.py"}
+
+    out = await narrow_scopes(
+        async_session, repo.id, {"src/unindexed.py": ["tests/conftest.py"]}, test_files
+    )
+
+    assert out == {"src/unindexed.py": ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]}
+
+
+async def test_the_ranking_orders_by_the_hops_the_collection_measures(async_session) -> None:
+    """A test importing the changed file directly runs before one importing it through another."""
+    from repowise.core.analysis.changed_lines import ChangeSet, FileDiff
+    from repowise.core.analysis.test_ranking import rank_change
+    from repowise.core.analysis.test_selection import Selection
+
+    repo = await insert_repo(async_session)
+    await _graph(
+        async_session,
+        repo.id,
+        tests={"tests/test_far.py", "tests/test_near.py"},
+        files={"src/api.py", "src/core.py"},
+        imports=[
+            ("src/api.py", "src/core.py"),
+            ("tests/test_far.py", "src/api.py"),
+            ("tests/test_near.py", "src/core.py"),
+        ],
+    )
+    out = _empty_result(1)
+    await _resolve_impacted(async_session, repo.id, {"src/core.py": None}, set(), out)
+    assert out["test_hops"] == {"tests/test_near.py": 1, "tests/test_far.py": 2}
+
+    change = ChangeSet({"src/core.py": FileDiff(path="src/core.py")}, set(), "t", None, None)
+    tests = ("tests/test_far.py", "tests/test_near.py")
+    selection = Selection(
+        run_all=False,
+        reasons=(),
+        tests=tests,
+        test_files=tests,
+        basis={"src/core.py": "import-graph"},
+    )
+    ranked = await rank_change(None, repo.id, change, out, selection, lambda _p: None)
+    assert [(r.test, r.tier, r.hops) for r in ranked] == [
+        ("tests/test_near.py", "direct", 1),
+        ("tests/test_far.py", "transitive", 2),
+    ]

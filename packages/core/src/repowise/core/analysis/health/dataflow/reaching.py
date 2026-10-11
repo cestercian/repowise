@@ -10,6 +10,7 @@ Per block ``b`` with predecessors ``pred(b)``::
     GEN[b]  = the last definition of each variable written in b
     KILL[b] = every definition of any variable b writes, except GEN[b]
     IN[b]   = union over p in pred(b) of OUT[p]
+              (IN[p] union every def in p, on a raise edge p -> b)
     OUT[b]  = GEN[b] union (IN[b] minus KILL[b])
 
 Definition sets are integer sets keyed by :attr:`defuse.Definition.index`, so
@@ -29,8 +30,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable, Iterator
+
     from .cfg import CFG
     from .defuse import Definition, FunctionDefUse
+    from .dialects.base import Occurrence
 
 
 @dataclass
@@ -59,13 +63,10 @@ class ReachingDefinitions:
         return [self.definitions[i] for i in sorted(idx)]
 
 
-def compute_reaching(
-    cfg: CFG,
-    fdu: FunctionDefUse,
-    *,
-    max_iterations: int | None = None,
-) -> ReachingDefinitions:
-    """Run the reaching-definitions fixpoint over *cfg* with *fdu*'s def facts."""
+def _block_facts(
+    cfg: CFG, fdu: FunctionDefUse
+) -> tuple[dict[int, frozenset[int]], dict[int, frozenset[int]], dict[int, frozenset[int]]]:
+    """GEN, KILL and every definition written, per block."""
     # All definitions of each variable -> the KILL sets.
     defs_by_var: dict[str, set[int]] = {}
     for d in fdu.definitions:
@@ -73,6 +74,7 @@ def compute_reaching(
 
     gen: dict[int, frozenset[int]] = {}
     kill: dict[int, frozenset[int]] = {}
+    every: dict[int, frozenset[int]] = {}
     for block in cfg.blocks:
         bdu = fdu.block(block.id)
         block_defs = bdu.defs if bdu is not None else []
@@ -85,7 +87,20 @@ def compute_reaching(
         for var in last_per_var:
             killed |= defs_by_var.get(var, set())
         gen[block.id] = gen_b
+        every[block.id] = frozenset(d.index for d in block_defs)
         kill[block.id] = frozenset(killed) - gen_b
+    return gen, kill, every
+
+
+def compute_reaching(
+    cfg: CFG,
+    fdu: FunctionDefUse,
+    *,
+    max_iterations: int | None = None,
+) -> ReachingDefinitions:
+    """Run the reaching-definitions fixpoint over *cfg* with *fdu*'s def facts."""
+    gen, kill, every = _block_facts(cfg, fdu)
+    raise_srcs = {src for src, _dst in cfg.raise_edges}
 
     in_sets: dict[int, frozenset[int]] = {b.id: frozenset() for b in cfg.blocks}
     out_sets: dict[int, frozenset[int]] = {b.id: gen[b.id] for b in cfg.blocks}
@@ -109,11 +124,17 @@ def compute_reaching(
 
         in_b: frozenset[int] = frozenset()
         for pred in block.predecessors:
-            in_b |= out_sets[pred]
+            # OUT[pred] is a subset of IN[pred] | every[pred].
+            if (pred, bid) in cfg.raise_edges:
+                in_b |= in_sets[pred] | every[pred]
+            else:
+                in_b |= out_sets[pred]
+        # A raise edge carries IN, so its target moves even when OUT does not.
+        in_moved = bid in raise_srcs and in_b != in_sets[bid]
         in_sets[bid] = in_b
 
         out_b = gen[bid] | (in_b - kill[bid])
-        if out_b != out_sets[bid]:
+        if out_b != out_sets[bid] or in_moved:
             out_sets[bid] = out_b
             for succ in block.successors:
                 if succ not in queued:
@@ -126,3 +147,51 @@ def compute_reaching(
         definitions=fdu.definitions,
         converged=converged,
     )
+
+
+def observed_definitions(
+    fdu: FunctionDefUse, reaching: ReachingDefinitions
+) -> Iterator[tuple[Occurrence, list[int]]]:
+    """Each read in *fdu* with the definition indices it may observe
+    (:func:`_observe`)."""
+    for bid, bdu in fdu.blocks.items():
+        if not bdu.uses:
+            continue
+        in_by_var: dict[str, list[int]] = {}
+        for i in reaching.in_sets.get(bid, frozenset()):
+            in_by_var.setdefault(reaching.definitions[i].var, []).append(i)
+        local_by_var: dict[str, list[Definition]] = {}
+        for d in bdu.defs:
+            local_by_var.setdefault(d.var, []).append(d)
+        for use in bdu.uses:
+            seen = _observe(local_by_var.get(use.name, []), in_by_var.get(use.name, ()), use.line)
+            yield use, seen
+
+
+def definitions_at(
+    fdu: FunctionDefUse, reaching: ReachingDefinitions, block_id: int, var: str, line: int
+) -> list[int]:
+    """The definition indices of *var* a read at *line* in *block_id* may
+    observe (:func:`_observe`)."""
+    bdu = fdu.block(block_id)
+    local = [d for d in bdu.defs if d.var == var] if bdu is not None else []
+    entering = [
+        i for i in reaching.in_sets.get(block_id, ()) if reaching.definitions[i].var == var
+    ]
+    return _observe(local, entering, line)
+
+
+def _observe(local: list[Definition], entering: Iterable[int], line: int) -> list[int]:
+    """A read at *line* observes the latest same-block definitions (*local*)
+    strictly before it or, when there is none, every definition *entering* the
+    block; plus any same-block definition at *line* itself, since lines alone
+    cannot order a write and a read sharing one. Over-marking is the safe side
+    for every consumer."""
+    earlier = [d for d in local if d.line < line]
+    if earlier:
+        latest = max(d.line for d in earlier)
+        seen = [d.index for d in earlier if d.line == latest]
+    else:
+        seen = list(entering)
+    seen.extend(d.index for d in local if d.line == line)
+    return seen

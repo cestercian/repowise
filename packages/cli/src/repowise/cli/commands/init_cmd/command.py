@@ -581,7 +581,8 @@ def _interactive_gate(
         "Write the subsystem (concept) pages as model prose (needs a key), or "
         "render the whole wiki from structure with no model and no spend. Every "
         "other page is structural either way. Default: prose when a key is "
-        "available. Use --mode fast for no wiki at all."
+        "available. With --no-prose, an explicit --provider or API key still "
+        "enables model-based decision extraction. Use --mode fast for no wiki at all."
     ),
 )
 @click.option(
@@ -1340,7 +1341,6 @@ def init_command(
         try:
             if (
                 provider_name
-                or (sys.stdin.isatty() is False)
                 or any(
                     os.environ.get(k)
                     for k in (
@@ -1976,6 +1976,11 @@ def init_command(
             save_key=save_key,
         )
 
+    # Every store is final: store the views ``repowise next`` and the
+    # dashboard read, before the editor files quote Fix first from them.
+    from repowise.cli.commands.update_cmd.persistence import refresh_read_snapshots
+
+    refresh_read_snapshots(repo_path)
     files_written = write_editor_project_files(
         console,
         repo_path,

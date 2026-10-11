@@ -43,6 +43,30 @@ logger = logging.getLogger(__name__)
 # happens to edit.
 SECURITY_SCANNER_VERSION = 2
 
+# detect-secrets allows a marker on the finding's line or the line above.
+_ALLOWLIST_SAME_RE = re.compile(r"(?:#|//|/\*)\s*pragma:\s*allowlist\s+secret\b")
+_ALLOWLIST_NEXT_RE = re.compile(
+    r"(?:#|//|/\*)\s*pragma:\s*allowlist\s+nextline\s+secret\b"
+)
+
+
+def _detect_secrets_allowlisted(
+    lines: list[str], uncommented: list[str], lineno: int
+) -> bool:
+    """Whether a pragma in a comment (not a string) allowlists this line."""
+
+    def marked(index: int, pattern: re.Pattern[str]) -> bool:
+        return any(
+            uncommented[index][m.start() : m.end()] != m.group()
+            for m in pattern.finditer(lines[index])
+        )
+
+    return 0 < lineno <= len(lines) and (
+        marked(lineno - 1, _ALLOWLIST_SAME_RE)
+        or (lineno > 1 and marked(lineno - 2, _ALLOWLIST_NEXT_RE))
+    )
+
+
 _CREDENTIAL_EXACT_PLACEHOLDERS: frozenset[str] = frozenset({"password", "changeit"})
 
 _CREDENTIAL_SUBSTRING_PLACEHOLDERS: tuple[str, ...] = (
@@ -224,6 +248,47 @@ _PATTERNS: list[tuple[re.Pattern, str, str]] = [
         "stripe_key",
         "high",
     ),
+    # GitLab's prefixed tokens: personal (also the routable form, whose payload
+    # ends in ``.`` plus a 9-char version and checksum), deploy, runner,
+    # pipeline trigger, OAuth app secret, incoming mail, CI job, and the legacy
+    # runner registration token. Minimum lengths, since newer forms run longer.
+    (
+        re.compile(
+            r"(?<![\w-])("
+            r"glpat-[\w-]{20,300}(?:\.[0-9a-z]{9})?"
+            r"|(?:gldt|glrt)-[\w-]{20,300}"
+            r"|glptt-[0-9a-f]{40}"
+            r"|gloas-[\w-]{64,300}"
+            r"|glimt-[\w-]{25,300}"
+            r"|glcbt-[0-9A-Za-z]{1,5}_[\w-]{20,300}"
+            r"|GR1348941[\w-]{20,300}"
+            r")(?![\w-])"
+        ),
+        "gitlab_token",
+        "high",
+    ),
+    # The 84-char Azure DevOps PAT carries ``AZDO`` at a fixed offset. The legacy
+    # 52-char lowercase base32 PAT has no marker and reads like any hash, so it
+    # is left to ``hardcoded_secret``, which needs a key-named variable.
+    (re.compile(r"\b([0-9A-Za-z]{76}AZDO[0-9A-Za-z]{4})\b"), "azure_devops_pat", "high"),
+    # ``https://user:password@host/repo``, only on a git remote: a forge host or a
+    # path ending in ``.git``. Database and broker URLs are left alone, since most
+    # in source are local dev defaults. A password that opens a variable
+    # (``$TOKEN``, ``${VAR}``, ``%VAR%``) or a slot (``<token>``, ``****``) is a
+    # template. ``git@host:o/r`` and ``ssh://git@host`` have no ``user:`` part.
+    (
+        re.compile(
+            r"(?i:\b(?:https?|git\+https|ssh)://)[^\s:/?#@'\"`<>]{1,100}:"
+            r"(?![$%{<*])([^\s/?#@'\"`<>]{1,200})@"
+            r"(?!(?i:localhost|127\.0\.0\.1|(?:[\w-]+\.)*example\.(?:com|org)|[\w.-]*\.local)"
+            r"(?![\w.-]))"
+            r"(?:(?i:(?:[\w-]+\.)*(?:github\.com|gitlab\.com|bitbucket\.org|dev\.azure\.com"
+            r"|visualstudio\.com)|(?:[\w-]+\.)*gitlab(?:\.[\w-]+)+)(?![\w.-])"
+            r"|[\w.-]+(?::\d+)?/[^\s'\"`<>?#]*\.git(?![\w-]))"
+        ),
+        "git_url_credentials",
+        "high",
+    ),
     (re.compile(r'f[\'"].*SELECT.*\{.*\}'), "fstring_sql", "med"),
     (re.compile(r"\.execute\(\s*[\'\"]\s*SELECT.*\+"), "concat_sql", "med"),
     (re.compile(r"verify\s*=\s*False"), "tls_verify_false", "med"),
@@ -351,6 +416,9 @@ SECRET_KINDS: frozenset[str] = frozenset(
         "slack_token",
         "google_api_key",
         "stripe_key",
+        "gitlab_token",
+        "azure_devops_pat",
+        "git_url_credentials",
         "private_key_pem",
     }
 )
@@ -365,15 +433,26 @@ SYMBOL_NAME_KINDS: frozenset[str] = frozenset({"security_sensitive_symbol"})
 
 _KEYWORD_KINDS: frozenset[str] = frozenset({"hardcoded_password", "hardcoded_secret"})
 
+# Which kind names a value several kinds saw; vendor shapes are the unlisted 2.
+# ``token = "https://oauth2:glpat-...@host"`` matches all three tiers at once.
+# ``git_url_credentials`` ranks lowest so it only adds findings: a keyword finding
+# that kept its kind keeps its baseline fingerprint.
+_SECRET_SPECIFICITY: dict[str, int] = {
+    "git_url_credentials": 0,
+    "hardcoded_password": 1,
+    "hardcoded_secret": 1,
+}
+
 # A snake_case or kebab-case name (``x-api-key``, ``repowise-security-ignore``)
 # is a key's or marker's name, a constant holding its own name, and a template
 # placeholder or shell substitution is filled in when it runs; none of them is a
 # credential. Letters only: a digit or capital makes it look like a key.
-_TEMPLATE_VALUE = re.compile(r"\{\{.*\}\}|\$\{[^}]*\}|\$\(.*\)")
+_TEMPLATE_VALUE = re.compile(r"\{\{.*?\}\}|\$\{.*?\}|\$\(.*?\)")
 _SCHEME_TEMPLATE_VALUE = re.compile(
-    r"(?i:(?:bearer|basic|token))\s+(?:\{\{.*\}\}|\$\{[^}]*\}|\$\(.*\))"
+    r"(?i:(?:bearer|basic|token))\s+(?:\{\{.*?\}\}|\$\{.*?\}|\$\(.*?\))"
 )
 _OWN_NAME_VALUE = re.compile(r"[A-Za-z_-]+")
+_CONSTANT_NAME = re.compile(r"[A-Z][A-Z0-9_]*")
 _KEY_NAME_VALUE = re.compile(r"[a-z]+(?:[_-][a-z]+)+|[a-z_]*_[a-z_]*")
 
 
@@ -396,6 +475,20 @@ def _is_secret_value(kind: str, val: str, name: str = "") -> bool:
     """True when *val*, captured by a *kind* pattern, looks like a real credential."""
     if not _is_valid_credential_value(val):
         return False
+    if kind == "git_url_credentials":
+        # ``ci:deploykey@``, ``user:pass1234@``: a word, not a token, and
+        # ``USER:PERSONAL_ACCESS_TOKEN@`` or ``user:glpat-secret@`` names one. A
+        # real token is long and mixed, or short and mixes three of lower,
+        # upper, digits and symbols.
+        if (
+            _is_plain_word(val)
+            or _CONSTANT_NAME.fullmatch(val)
+            or _KEY_NAME_VALUE.fullmatch(val)
+        ):
+            return False
+        classes = (str.islower, str.isupper, str.isdigit, lambda c: not c.isalnum())
+        mixed = sum(any(map(f, val)) for f in classes)
+        return mixed >= 3 or (mixed >= 2 and len(val) >= 12)
     if kind not in _KEYWORD_KINDS:
         return True
     value = val.strip()
@@ -405,8 +498,8 @@ def _is_secret_value(kind: str, val: str, name: str = "") -> bool:
         return False
     # A leading ``--`` is a CSS custom property or a CLI flag, not a key.
     return not (
-        _TEMPLATE_VALUE.fullmatch(value)
-        or _SCHEME_TEMPLATE_VALUE.fullmatch(value)
+        _TEMPLATE_VALUE.search(value)
+        or _SCHEME_TEMPLATE_VALUE.search(value)
         or _is_plain_word(value)
         or value.startswith("--")
     )
@@ -805,8 +898,7 @@ def scan_source(file_path: str, source: str, symbols: Iterable[Any] = ()) -> lis
         if not _ANY_PATTERN.search(line):
             continue
         snippet: str | None = None
-        keyword_hits: list[tuple[dict, str]] = []
-        vendor_values: list[str] = []
+        secret_hits: list[tuple[dict, str, int]] = []
         for pattern, kind, severity in _PATTERNS:
             if kind in _CALL_KINDS:
                 continue
@@ -843,13 +935,12 @@ def scan_source(file_path: str, source: str, symbols: Iterable[Any] = ()) -> lis
                     "line": lineno,
                 }
                 findings.append(finding)
-                if kind in _KEYWORD_KINDS:
-                    keyword_hits.append((finding, value))
-                elif kind in SECRET_KINDS:
-                    vendor_values.append(value)
-        # One secret, one finding: the vendor shape already names what the keyword saw.
-        for finding, value in keyword_hits:
-            if any(vendor in value for vendor in vendor_values):
+                if kind in SECRET_KINDS:
+                    secret_hits.append((finding, value, _SECRET_SPECIFICITY.get(kind, 2)))
+        # One secret, one finding: the highest-ranked kind that saw it names it.
+        # Either value can hold the other: a keyword's runs to the closing quote.
+        for finding, value, rank in secret_hits:
+            if any(r > rank and (o in value or value in o) for _, o, r in secret_hits):
                 findings.remove(finding)
 
     # Calls that open on one line and set ``shell=True`` on a later one; reported
@@ -933,7 +1024,16 @@ def scan_source(file_path: str, source: str, symbols: Iterable[Any] = ()) -> lis
                 }
             )
 
-    return findings
+    uncommented = (
+        source_lines(_mask_comments_and_strings(source, strings=False))
+        if "pragma: allowlist" in source
+        else lines
+    )
+    return [
+        f for f in findings
+        if f["kind"] not in SECRET_KINDS
+        or not _detect_secrets_allowlisted(lines, uncommented, f["line"])
+    ]
 
 
 def scan_source_map(
@@ -1151,6 +1251,9 @@ class SecurityScanner:
                     ),
                     deduped,
                 )
+            from repowise.core.persistence.crud.repository import stamp_analysis_ran
+
+            await stamp_analysis_ran(self._session, self._repo_id, "security")
         except Exception as exc:
             # Pre-migration, the table does not exist yet — silently skip (the
             # historical contract for indexing against a not-yet-migrated DB).

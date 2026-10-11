@@ -118,23 +118,6 @@ def _truncate_body(body: str) -> str:
     return encoded[:_MAX_COMMIT_BODY_BYTES].decode("utf-8", errors="ignore")
 
 
-# PR/squash-description markers — a body containing one of these reads like a
-# real PR write-up worth retaining for decision mining (mirrors the extractor's
-# ``_PR_BODY_MARKERS``; kept here to avoid a cross-package import at index time).
-_PR_BODY_MARKERS: tuple[str, ...] = (
-    "## why",
-    "## motivation",
-    "## what",
-    "## changes",
-    "## context",
-    "## summary",
-    "closes #",
-    "fixes #",
-    "resolves #",
-    "before:",
-    "after:",
-)
-
 # Co-change pair extraction widens the window because individual files
 # may only co-change a handful of times in 500 commits. On low-churn repos
 # the 500-commit window produced 0 co-change pairs every run; 2000 commits
@@ -344,6 +327,29 @@ _CO_CHANGE_COMMIT_DECAY_TAU: float = CO_CHANGE_COMMIT_DECAY_TAU
 # Hotspot temporal decay: half-life for exponentially weighted churn score.
 HOTSPOT_HALFLIFE_DAYS: float = 180.0
 
+#: The rules that turn git history into stored per-file rows (change numbers,
+#: author identity). Stamped into state.json as ``git_history_version`` by every
+#: full git walk; an update that finds another value, or none, walks the whole
+#: history once instead of only the changed files, since a changed file's row is
+#: the only one an incremental walk rewrites. Bump it when such a rule changes.
+#:
+#: v1: change numbers and author identity read through ``repowise.core.forges``
+#: (GitLab ``!N`` merge requests, Azure and Bitbucket PRs, GitLab noreply and
+#: forge bot accounts).
+GIT_HISTORY_VERSION: int = 1
+GIT_HISTORY_VERSION_KEY = "git_history_version"
+
+
+def git_history_stale(state: dict[str, Any]) -> bool:
+    """Whether the stored git rows predate :data:`GIT_HISTORY_VERSION`.
+
+    Unlike the health analyzer stamp, a missing stamp counts as stale: the
+    rows of an index written before it carry the change-number and identity
+    defects v1 fixes, and only a full walk rewrites the rows of files that
+    do not change.
+    """
+    return state.get(GIT_HISTORY_VERSION_KEY) != GIT_HISTORY_VERSION
+
 # Absolute activity floors for hotspot classification (issue #361). The
 # churn percentile is repo-relative, so on a quiet repo "top quartile"
 # degenerates to "any file touched in the last 90 days" — a single drive-by
@@ -365,10 +371,6 @@ HOTSPOT_HALFLIFE_DAYS: float = 180.0
 HOTSPOT_MIN_COMMITS_90D: int = 3
 HOTSPOT_MIN_TEMPORAL_SCORE: float = 0.5
 HOTSPOT_HIGH_COMMITS_90D: int = 8
-
-# Regex to extract PR/MR numbers from commit messages.
-# Matches: "#123", "Merge pull request #456", "(#789)", "!42" (GitLab MR)
-_PR_NUMBER_RE = re.compile(r"(?:pull request |)\#(\d+)|\(#(\d+)\)|!(\d+)")
 
 # Allowlist of extensions for which per-file git indexing (blame, commit
 # history, hotspot/stable classification) is worth running.  Anything NOT in

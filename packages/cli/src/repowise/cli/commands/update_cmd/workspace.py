@@ -584,6 +584,8 @@ def _refresh_workspace_editor_project_files(
     from repowise.cli.editor_integrations.defaults import get_default_project_file_overrides
     from repowise.cli.editor_setup import EditorSetupOptions, refresh_editor_project_files
 
+    from .persistence import refresh_read_snapshots
+
     options: EditorSetupOptions | None = None
     if agents_md is not None:
         options = EditorSetupOptions(
@@ -595,6 +597,7 @@ def _refresh_workspace_editor_project_files(
         repo_path = (ws_root / entry.path).resolve()
         if not (repo_path / ".repowise").is_dir():
             continue
+        refresh_read_snapshots(repo_path)
         try:
             refresh_editor_project_files(console, repo_path, options=options)
         except Exception as exc:

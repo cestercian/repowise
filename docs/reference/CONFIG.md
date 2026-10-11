@@ -156,6 +156,7 @@ You can edit this file directly. Changes take effect on the next `init`,
 | `distill` | see below | Output distillation config |
 | `mcp` | see below | MCP tool surface config |
 | `refactoring` | see below | Refactoring-intelligence config |
+| `forges.hosts` | `{}` | Maps a self-managed git host to its forge (`github`, `gitlab`, `azure`, `bitbucket`, `generic`). See [GIT_HOSTS.md](../start/GIT_HOSTS.md#self-managed-hosts) |
 
 `reasoning` controls documentation-generation calls for reasoning-capable chat
 models. `auto` preserves provider defaults. `off`/`none` disable Qwen3-style
@@ -597,15 +598,13 @@ refactoring:
     disabled: []              # e.g. [move_method] to silence one detector
   min_confidence: null        # low | medium | high (confidence floor; null = no floor)
   llm:
-    enabled: true             # code generation, on by default; set false to disable
-    provider: null            # falls back to the repo's configured LLM provider
-    model: null                # falls back to the repo's configured model
+    enabled: false            # code generation, off by default; uses chat's provider and model
 ```
 
 - The deterministic layer is **zero-LLM** and runs in the `init` / `update`
-  health pass. Code generation is the only part that calls a provider: it is on
-  by default but never runs during indexing, only on an explicit request (set
-  `llm.enabled: false` to disable it).
+  health pass. Code generation is the only part that calls a provider: it is off
+  by default and never runs during indexing, only on an explicit request (set
+  `llm.enabled: true` to enable it).
 - `enabled: false` skips the whole deterministic detector pass; `detectors.disabled`
   silences named detectors (`extract_class`, `split_file`, ...) while the rest run.
 - `min_confidence` is a floor applied when the plans are detected, so a plan below it
@@ -1018,6 +1017,7 @@ Anonymous usage telemetry is **enabled by default** (opt-out).
 |----------|-------------|
 | `REPOWISE_GIT_WINDOW_ANCHOR` | Git history windows (90-day churn, prior defects, decay, blame age) are measured from the indexed commit's committer date by default. Set to `now` to measure them from wall-clock time instead |
 | `REPOWISE_SKIP_EDITOR_SETUP` | Truthy value stops `init` writing to your machine-wide editor config: the Claude Code / Claude Desktop MCP entry, the Claude Code hooks, and the distill rewrite-hook offer. Same switch as `init --no-editor-setup` ([CLI_REFERENCE.md](CLI_REFERENCE.md#repowise-init-path)); the env var is the one to use for CI, sandboxes, and benchmark runs that index many repos. Project-local files (`.repowise/mcp.json`, `CLAUDE.md`, Codex config) are written either way |
+| `REPOWISE_FORGE_HOSTS` | Self-managed git hosts as `host=forge` pairs separated by commas (`git.corp.com=gitlab,tfs.corp.com=azure`). Wins over `forges.hosts` in `config.yaml` |
 | `REPOWISE_CHANGELOG` | Override the changelog source used by the "what's new" check |
 | `REPOWISE_PARSE_WORKERS` | How many processes parse files during indexing. Defaults to your CPU count capped at 8, and never exceeds the number of files to parse. Each worker is a separate interpreter holding roughly 50 MB, so lower it on a memory-constrained machine; raising it above 8 is not measurably faster |
 

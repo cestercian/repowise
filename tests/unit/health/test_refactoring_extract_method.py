@@ -20,6 +20,7 @@ from repowise.core.analysis.health.refactoring.extract_method import (
     recovered_share,
 )
 from repowise.core.analysis.health.refactoring.models import RefactoringContext
+from repowise.core.ingestion.parser import _get_language
 
 # A long function whose tail (compute-average loop) is a clean extraction.
 _PROCESS = """
@@ -92,6 +93,92 @@ def test_finds_clean_extraction_with_inferred_signature():
     assert best.slice_nloc >= 5
 
 
+# The same tail as _PROCESS, with a comment opening the else arm. The CFG fix keeps
+# the arm's block on the statement's line, so the slice still sees it.
+_PROCESS_ELSE_COMMENT = """
+def process(records, threshold):
+    results = []
+    errors = 0
+    for r in records:
+        if r is None:
+            errors += 1
+            continue
+        results.append(r)
+    total = 0
+    count = 0
+    for v in results:
+        if v > threshold:
+            total += v
+            count += 1
+        else:
+            # count the misses too
+            total -= v
+    average = total / count if count else 0
+    return average, errors
+"""
+
+
+def test_a_comment_opening_the_else_arm_still_yields_the_same_extraction():
+    # The comment must not change which span is offered or the parameters it takes.
+    lmap = get_language_map("python")
+    extractions = find_extractions(_first(_PROCESS_ELSE_COMMENT), lmap)
+    assert extractions, "expected at least one extraction"
+    best = extractions[0]
+    assert "average" in best.returns
+    assert "results" in best.params and "threshold" in best.params
+    assert len(best.returns) <= 1
+    assert best.ccn_removed >= 1
+    assert best.slice_nloc >= 5
+
+
+_JAVA_SWITCH_RULE_YIELD = """
+class A {
+    int pick(int[] xs, int k) {
+        int total = 0;
+        for (int x : xs) {
+            total += x;
+        }
+        int r = switch (k) {
+            case 1 -> {
+                int t = 0;
+                for (int x : xs) {
+                    if (x > 0) {
+                        t += x;
+                    }
+                    if (x > 10) {
+                        t -= 1;
+                    }
+                }
+                yield t;
+            }
+            default -> 0;
+        };
+        return r + total;
+    }
+}
+"""
+
+
+def test_a_java_switch_rule_yield_refuses_spans_that_hold_it():
+    # Lifting a span that contains a switch-rule `yield` into a helper would
+    # move the yield out of the switch rule it belongs to, so the plan cannot
+    # compile. Spans that stop before the yield stay offered.
+    if _get_language("java") is None:
+        pytest.skip("tree-sitter language pack missing for java")
+    res = analyze_file("m.java", "java", _JAVA_SWITCH_RULE_YIELD.encode(), flagged_only=False)
+    if res.stats.functions_seen == 0:
+        pytest.skip("tree-sitter language pack missing for java")
+    fn = res.functions[0]
+    lmap = get_language_map("java")
+    extractions = find_extractions(fn, lmap)
+    assert extractions, "expected at least one extraction"
+    # The yield is on line 19; no offered span may end on it, and the span
+    # that stops just before it stays the best one.
+    assert all(extraction.end_line != 19 for extraction in extractions)
+    best = extractions[0]
+    assert (best.start_line, best.end_line) == (10, 18)
+
+
 def test_no_extraction_when_every_span_has_a_jump():
     # A guard-clause cascade: every span contains a return, so nothing is a
     # single-exit slice -> no candidate.
@@ -158,18 +245,20 @@ def _find_extractions_reference(analysis, lmap):
         _MIN_SLICE_NLOC,
         _MIN_STMTS,
         Extraction,
-        _all_blocks,
         _declared_before_read,
         _exit_macros,
         _function_lines,
         _infer_in_out,
-    _loop_carry_free,
-    _outs_definitely_assigned,
+        _loop_carry_free,
+        _outs_definitely_assigned,
+        _reads_observing,
+        _Scan,
         _sorted,
         _span_metrics,
         _stmts_nloc,
         _unwrap_container,
         _var_lines,
+        all_blocks,
     )
 
     fn_node = analysis.fn_node
@@ -183,6 +272,7 @@ def _find_extractions_reference(analysis, lmap):
     body_nloc = _stmts_nloc(body_container.named_children, lines)
     def_lines, use_lines = _var_lines(analysis.def_use)
     declared_first = _declared_before_read(analysis.def_use)
+    reads = _reads_observing(analysis, def_lines)
     decision_kinds = (
         lmap.branch_kinds
         | lmap.loop_kinds
@@ -206,7 +296,7 @@ def _find_extractions_reference(analysis, lmap):
 
     out = []
     evaluated = 0
-    for block, loop in _all_blocks(fn_node, lmap.block_kinds, scope_kinds, lmap.loop_kinds):
+    for block, loop in all_blocks(fn_node, lmap.block_kinds, scope_kinds, lmap.loop_kinds):
         stmts = block.named_children
         n = len(stmts)
         is_body = block.id == body_container.id
@@ -227,13 +317,15 @@ def _find_extractions_reference(analysis, lmap):
                 ):
                     continue
                 span = stmts[i : j + 1]
-                decisions, has_jump, has_await = _span_metrics(
+                decisions, has_jump, has_await, *_ = _span_metrics(
                     span,
-                    decision_kinds,
-                    jump_kinds,
-                    scope_kinds,
-                    _exit_macros(lmap),
-                    (lmap.await_kinds, lmap.await_scope_kinds),
+                    _Scan(
+                        decision_kinds,
+                        jump_kinds,
+                        scope_kinds,
+                        _exit_macros(lmap),
+                        (lmap.await_kinds, lmap.await_scope_kinds),
+                    ),
                 )
                 if has_jump or decisions < _MIN_CCN_REMOVED:
                     continue
@@ -242,7 +334,9 @@ def _find_extractions_reference(analysis, lmap):
                     continue
                 s = span[0].start_point[0] + 1
                 e = span[-1].end_point[0] + 1
-                params, returns = _infer_in_out(def_lines, use_lines, s, e, declared_first)
+                params, returns = _infer_in_out(
+                    def_lines, use_lines, s, e, declared_first, reads=reads
+                )
                 if len(params) > _MAX_PARAMS or len(returns) > _MAX_RETURNS:
                     continue
                 if not _outs_definitely_assigned(span, returns, def_lines, lmap):
@@ -575,8 +669,30 @@ def test_detector_emits_suggestion_for_flagged_function():
     assert 0 < share < 1
     assert s.impact_delta == round(1.5 * share, 3)
     # Plan shape is the locked schema.
-    assert set(s.plan) == {"span", "params", "returns", "suggested_name", "needs_async"}
+    assert set(s.plan) == {
+        "span",
+        "params",
+        "returns",
+        "suggested_name",
+        "needs_async",
+        "new_symbol",
+        "call_site",
+        "anchors",
+    }
     assert s.plan["needs_async"] is False
+    # A module-level function: the helper is a plain function too.
+    assert s.plan["new_symbol"] == {
+        "kind": "function",
+        "async": False,
+        "receiver": None,
+        "uses_receiver": False,
+        "assigns": [],
+        "params": s.plan["new_symbol"]["params"],
+        "returns": s.plan["new_symbol"]["returns"],
+        "signature_text": s.plan["new_symbol"]["signature_text"],
+        "return_text": "return average",
+    }
+    assert s.plan["call_site"]["replace_span"] == s.plan["span"]
     assert set(s.plan["span"]) == {"start", "end"}
     assert set(s.evidence) == {"slice_nloc", "ccn_removed"}
     # A categorical claim, not a count: extraction is local, so there is nothing
@@ -597,7 +713,8 @@ def test_plan_carries_a_computed_name_not_a_hardcoded_none():
     # The slice's single OUT value is ``average``, so the span is by
     # construction the code that computes it.
     assert s.plan["returns"] == ["average"]
-    assert s.plan["suggested_name"] == "compute_average"
+    # In Python's private form.
+    assert s.plan["suggested_name"] == "_compute_average"
 
 
 class _Extraction:
@@ -679,7 +796,7 @@ def test_suggested_name_keeps_the_out_values_own_casing():
 @pytest.mark.parametrize(
     ("language", "expected"),
     [
-        ("python", "compute_average"),
+        ("python", "_compute_average"),
         ("rust", "compute_average"),
         ("cpp", "compute_average"),
         ("java", "computeAverage"),
@@ -923,7 +1040,9 @@ def test_a_best_span_below_the_floor_yields_to_the_next_one(monkeypatch):
 
     trivial = Extraction(10, 17, ("a",), (), slice_nloc=8, ccn_removed=1)
     worth = Extraction(20, 27, ("b",), (), slice_nloc=8, ccn_removed=3)
-    monkeypatch.setattr(extract_method, "find_extractions", lambda _a, _l: [trivial, worth])
+    monkeypatch.setattr(extract_method, "find_extractions", lambda _a, _l, _r=None, _p=None, _rf=None: [trivial, worth])
+    # No parsed source to anchor against: this pins span choice, not anchoring.
+    monkeypatch.setattr(extract_method, "anchor_plan", lambda _plan, _fn: True)
     fn = _Shape(12, 40)
     analysis = type(
         "A", (), {"name": "f", "start_line": 1, "end_line": 50, "ccn": 12, "nloc": 40,
@@ -1136,8 +1255,9 @@ def test_a_refused_span_yields_only_to_a_disjoint_one(monkeypatch):
     shrunk = Extraction(2, 55, ("a",), (), slice_nloc=40, ccn_removed=8)  # overlaps it
     disjoint = Extraction(85, 95, ("b",), (), slice_nloc=10, ccn_removed=3)
     monkeypatch.setattr(
-        extract_method, "find_extractions", lambda _a, _l: [whole, shrunk, disjoint]
+        extract_method, "find_extractions", lambda _a, _l, _r=None, _p=None, _rf=None: [whole, shrunk, disjoint]
     )
+    monkeypatch.setattr(extract_method, "anchor_plan", lambda _plan, _fn: True)
     analysis = type(
         "A", (), {"name": "f", "start_line": 1, "end_line": 100, "ccn": 30, "nloc": 90,
                   "fn_node": None}
@@ -1151,3 +1271,82 @@ def test_a_refused_span_yields_only_to_a_disjoint_one(monkeypatch):
     )
     (s,) = ExtractMethodDetector().detect(ctx)
     assert s.plan["span"] == {"start": 85, "end": 95}
+
+
+def _span_in_out(src: str, s: int, e: int):
+    from repowise.core.analysis.health.dataflow import slice as slicer
+
+    fn = _first(src)
+    def_lines, use_lines = slicer._var_lines(fn.def_use)
+    declared_first = slicer._declared_before_read(fn.def_use)
+    reads = slicer._reads_observing(fn, def_lines)
+    return slicer._infer_in_out(def_lines, use_lines, s, e, declared_first, reads=reads)
+
+
+def test_a_comprehension_binder_is_not_a_parameter():
+    # Seen on get_health_findings: an earlier comprehension's ``v`` made the
+    # span's own ``v`` an input, and the call passed a name the caller lacks.
+    src = """
+    def f(severity, order, t):
+        exact = [v.strip() for v in severity if v]
+        b = len(exact)
+        allowed = [k for k, v in order.items() if v >= t]
+        return allowed, b
+    """
+    assert _span_in_out(src, 4, 5) == (("exact", "order", "t"), ("allowed", "b"))
+
+
+def test_an_import_path_naming_a_parameter_is_not_a_read():
+    # Seen on _lifespan: ``from repowise.server...`` read its ``server`` parameter.
+    src = """
+    def f(server, root):
+        a = root / "x"
+        from repowise.server.enrich import Enricher
+        e = Enricher(a)
+        return e
+    """
+    assert _span_in_out(src, 4, 5) == (("a",), ("e",))
+
+
+def test_a_span_holding_an_import_read_after_it_is_refused():
+    # The import would leave with the helper; an imported name is never made
+    # an input or output (the helper re-imports it).
+    src = """
+    def f(a, c):
+        from pkg.mod import Thing
+        if c:
+            a += 1
+        t = Thing(a)
+        return t
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        from repowise.core.analysis.health.dataflow import slice as slicer
+
+        mp.setattr(slicer, "_MAX_BODY_SHARE", float("inf"))
+        mp.setattr(slicer, "_MIN_SLICE_NLOC", 1)
+        spans = find_extractions(_first(src), get_language_map("python"))
+    found = {(x.start_line, x.end_line): (x.params, x.returns) for x in spans}
+    assert (3, 5) not in found
+    assert (4, 6) not in found
+    assert found[(3, 6)] == (("a", "c"), ("t",))
+
+
+@pytest.mark.parametrize(
+    ("prefix", "inside", "floor", "offered"),
+    [("import json\n", "", 0, True), ("", "    import json\n", 2, False)],
+)
+def test_import_scope_controls_extractability(prefix, inside, floor, offered):
+    src = f"""{prefix}def f(v):
+{inside}    n = 0
+    dump = lambda x: json.dumps(x)
+    if v: n += len(dump(v))
+    if n: n += len(dump(n))
+    return n
+"""
+    with pytest.MonkeyPatch.context() as mp:
+        from repowise.core.analysis.health.dataflow import slice as slicer
+
+        mp.setattr(slicer, "_MAX_BODY_SHARE", float("inf"))
+        mp.setattr(slicer, "_MIN_SLICE_NLOC", 1)
+        spans = find_extractions(_first(src), get_language_map("python"))
+    assert any(floor < x.start_line <= 4 <= x.end_line for x in spans) is offered

@@ -280,8 +280,11 @@ export function MobileNav({ repos = [], workspace }: MobileNavProps) {
             <div className="flex items-center justify-between gap-2">
               <VersionFooter />
               <div className="flex items-center gap-1">
-                <LanguageSwitcher compact />
-                <ThemeToggle compact />
+                <LanguageSwitcher />
+                <ThemeToggle
+                  switchToDarkLabel={ts("switchToDarkTheme")}
+                  switchToLightLabel={ts("switchToLightTheme")}
+                />
               </div>
             </div>
           </div>
