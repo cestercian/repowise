@@ -984,7 +984,7 @@ The `.repowise/.env` file is gitignored automatically.
 | `EDENAI_EMBEDDING_TIMEOUT` | As above, `edenai` only |
 | `OLLAMA_EMBEDDING_MODEL` | Ollama embedding model (also selects the `ollama` embedder) |
 | `OLLAMA_EMBEDDING_DIMS` | Ollama embedding output dimensions (optional; inferred from the model otherwise) |
-| `OLLAMA_EMBEDDING_TIMEOUT` | As above, `ollama` only; raise it for long pages on slow local models |
+| `OLLAMA_EMBEDDING_TIMEOUT` | As above, `ollama` only. With neither variable set, an Ollama request gets 30s plus 2ms per input character, so a full chunk of long pages on a CPU-only model is not cut off. Setting either variable pins the timeout to that value |
 
 ### Server and database
 
